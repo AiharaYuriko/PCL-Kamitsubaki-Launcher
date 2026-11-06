@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 主页预设反馈
+    url: https://github.com/Meloong-Git/PCL/discussions/categories/自定义主页
+    about: 提交与预设的主页（设置 → 个性化 → 主页预设）中的具体内容相关的反馈
+  - name: 帮助文档反馈
+    url: https://github.com/LTCatt/PCL2Help/issues
+    about: 提交与 PCL 帮助文档（更多 → 帮助）中的具体内容相关的反馈
+  - name: 本修改版的问题与反馈
+    url: https://github.com/AiharaYuriko/PCL-Kamitsubaki-Launcher/issues
+    about: 请将神椿市修改版的问题提交到这里，不要提交给上游作者。

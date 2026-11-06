@@ -1,0 +1,321 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "pcl.modpack.release.v1"
+    },
+    "pack": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        },
+        "icon_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ]
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "channel": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "sequence",
+        "channel",
+        "notes"
+      ]
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "minecraft": {
+          "type": "string",
+          "minLength": 1
+        },
+        "loader": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "neoforge"
+            },
+            "version": {
+              "type": "string",
+              "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?(?:-beta)?$"
+            }
+          },
+          "required": [
+            "type",
+            "version"
+          ]
+        },
+        "minecraft_change": {
+          "const": "new-instance"
+        },
+        "allow_loader_downgrade": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "minecraft",
+        "loader",
+        "minecraft_change",
+        "allow_loader_downgrade"
+      ]
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "default_selected": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "required",
+          "default_selected"
+        ]
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*\\\\)(?!.*[:*?\"<>|\\x00-\\x1f])(?!(?:.*/)?\\.{1,2}(?:/|$))(?!.*//)(?!.*[ .](?:/|$)).*[^/]$"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "urls": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https://"
+            }
+          },
+          "component": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+          },
+          "category": {
+            "enum": [
+              "mod",
+              "config",
+              "script",
+              "resourcepack",
+              "shaderpack",
+              "file"
+            ]
+          },
+          "write_policy": {
+            "enum": [
+              "replace",
+              "preserve"
+            ]
+          },
+          "display": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "minLength": 1
+              },
+              "icon_url": {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https://"
+              },
+              "modrinth_project_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "curseforge_project_id": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "required": []
+          }
+        },
+        "required": [
+          "path",
+          "sha256",
+          "size",
+          "urls",
+          "category",
+          "write_policy"
+        ]
+      }
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*\\\\)(?!.*[:*?\"<>|\\x00-\\x1f])(?!(?:.*/)?\\.{1,2}(?:/|$))(?!.*//)(?!.*[ .](?:/|$)).*[^/]$"
+          },
+          "action": {
+            "enum": [
+              "delete",
+              "disable"
+            ]
+          },
+          "component": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+          },
+          "expected_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "display": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "minLength": 1
+              },
+              "icon_url": {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https://"
+              },
+              "modrinth_project_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "curseforge_project_id": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "required": []
+          }
+        },
+        "required": [
+          "path",
+          "action",
+          "expected_sha256",
+          "reason"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "action": {
+                  "const": "disable"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "path": {
+                  "pattern": "^mods/.+\\.jar$"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "cleanup": {
+      "const": "previously-managed-unmodified"
+    }
+  },
+  "required": [
+    "schema",
+    "pack",
+    "release",
+    "runtime",
+    "components",
+    "files",
+    "actions",
+    "cleanup"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PCL modpack release v1",
+  "description": "PCL 专用完整目标快照。不能交给旧 Python 客户端。附加语义约束见 SPEC.md。"
+}

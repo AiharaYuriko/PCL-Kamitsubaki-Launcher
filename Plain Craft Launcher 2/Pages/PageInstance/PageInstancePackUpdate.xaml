@@ -1,0 +1,35 @@
+<local:MyPageRight x:Class="PageInstancePackUpdate"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="clr-namespace:PCL" PanScroll="PanBack">
+    <local:MyScrollViewer x:Name="PanBack" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Margin="25,10">
+            <local:MyCard Title="更新源" Margin="0,15,0,15">
+                <StackPanel Margin="25,40,25,20">
+                    <TextBlock Text="粘贴服主提供的地址，即可检查此实例的整合包更新。" TextWrapping="Wrap" Margin="0,0,0,12" />
+                    <Grid Margin="0,0,0,12">
+                        <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <local:MyTextBox x:Name="Source" HintText="https://更新服务器/pcl/index.json" Margin="0,0,12,0" Height="35" VerticalContentAlignment="Center" />
+                        <local:MyButton x:Name="ReadSource" Grid.Column="1" Text="读取更新源" Width="120" Height="35" />
+                    </Grid>
+                    <local:MyComboBox x:Name="Choices" Height="30" />
+                </StackPanel>
+            </local:MyCard>
+            <local:MyCard Title="检查与更新" Margin="0,0,0,15">
+                <StackPanel Margin="25,40,25,20">
+                    <WrapPanel x:Name="Components" />
+                    <TextBlock x:Name="Status" TextWrapping="Wrap" Margin="0,4,0,15" />
+                    <ProgressBar x:Name="Bar" Height="3" Margin="0,0,0,15" />
+                    <WrapPanel>
+                        <local:MyButton x:Name="Update" Text="更新整合包" ColorType="Highlight" Height="35" MinWidth="140" Margin="0,0,15,0" IsEnabled="False" />
+                        <local:MyButton x:Name="Check" Text="重新检查" Height="35" MinWidth="120" Margin="0,0,15,0" />
+                        <local:MyButton x:Name="Restore" Text="恢复上次更新" Height="35" MinWidth="140" />
+                    </WrapPanel>
+                </StackPanel>
+            </local:MyCard>
+            <local:MyCard Title="文件变化" Margin="0,0,0,15">
+                <StackPanel x:Name="Details" Margin="15,40,15,15" />
+            </local:MyCard>
+        </StackPanel>
+    </local:MyScrollViewer>
+</local:MyPageRight>

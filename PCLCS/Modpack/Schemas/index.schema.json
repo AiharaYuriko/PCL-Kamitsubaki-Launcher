@@ -1,0 +1,88 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "pcl.modpack.index.v1"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "packs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": {
+            "type": "string"
+          },
+          "icon_url": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://"
+          },
+          "channels": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+                },
+                "release_id": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+                },
+                "sequence": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "manifest_url": {
+                  "type": "string",
+                  "format": "uri",
+                  "pattern": "^https://"
+                },
+                "manifest_sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                }
+              },
+              "required": [
+                "id",
+                "release_id",
+                "sequence",
+                "manifest_url",
+                "manifest_sha256"
+              ]
+            }
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "channels"
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "name",
+    "packs"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PCL modpack index v1"
+}
