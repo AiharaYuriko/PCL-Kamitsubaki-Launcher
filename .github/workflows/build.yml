@@ -27,27 +27,20 @@ jobs:
           describe=`git describe --tags --always`
           echo "describe=$describe" >> $GITHUB_ENV
 
-    - name: Setup MSBuild.exe
-      uses: microsoft/setup-msbuild@v3
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
       with:
-        msbuild-architecture: x64
+        dotnet-version: '9.0.x'
 
-    - name: Inject Microsoft Client ID
+    - name: Build launcher
       shell: pwsh
       env:
         PCL_MS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
-      run: ./scripts/Set-BuildClientId.ps1
-
-    # Keep the upstream bundled Help.zip; do not fetch changing help during builds.
-
-    - name: Restore NuGet Packages
-      run: dotnet restore PCLCS\PCLCS.csproj
-
-    - name: Build
-      run: msbuild "Plain Craft Launcher 2\Plain Craft Launcher 2.vbproj" -p:Configuration=${{ matrix.configuration }}
+      run: ./scripts/Build-Launcher.ps1 -Configuration '${{ matrix.configuration }}'
 
     - name: Upload a Build Artifact
       uses: actions/upload-artifact@v7
       with:
         name: ${{ matrix.configuration }} ${{ env.describe }}
-        path: Plain Craft Launcher 2\obj\${{ matrix.configuration }}\Plain Craft Launcher 2.exe
+        path: artifacts/${{ matrix.configuration }}/
+        if-no-files-found: error

@@ -10,7 +10,7 @@
 - 新增实例内整合包更新页面，以及文件校验、备份、回退和中断恢复逻辑。
 - 新增定制版更新和文本公告服务，支持 HTTPS 下载、SHA-256 校验及公告去重。
 
-目前处于开发阶段：Client ID 通过 GitHub Secrets 在构建时注入，Minecraft 应用审核与真实登录测试待完成；更新和公告地址待配置。核心在线服务模拟测试已通过，完整 WPF 构建的 XAML 生成问题仍待解决，暂未发布定制版 EXE。
+目前处于开发阶段：Client ID 在构建时注入，Minecraft 应用审核与真实登录测试待完成；更新和公告地址待配置。Windows Release 构建、单文件启动及整合包更新页面检查已通过，在线服务和整合包更新器回归测试通过。EXE 可通过下述脚本构建。
 
 ## Microsoft / Minecraft application review
 
@@ -32,7 +32,17 @@ git clone --recurse-submodules https://github.com/AiharaYuriko/PCL-Kamitsubaki-L
 cd PCL-Kamitsubaki-Launcher
 ```
 
-主项目使用 Visual Basic/WPF 与 .NET Framework 4.8，另含 C# 项目和 MeloongCore 子模块。请使用安装了 .NET 桌面开发工作负载、.NET Framework 4.8 targeting pack 及兼容 C# 13 工具链的 Visual Studio/MSBuild。打开 `Plain Craft Launcher 2.sln`，还原 NuGet 依赖后构建。单独使用 `dotnet build` 不是已验证的主程序构建方式。
+主项目使用 Visual Basic/WPF 与 .NET Framework 4.8，另含 C# 项目和 MeloongCore 子模块。需要 Visual Studio / Build Tools 的完整 MSBuild（含 WPF 构建支持）和 .NET SDK 9 或更新版本。
+
+设置进程环境变量 `PCL_MS_CLIENT_ID` 后，在 PowerShell 中运行：
+
+```powershell
+./scripts/Build-Launcher.ps1 -Configuration Release
+```
+
+脚本自动还原子模块与 NuGet 依赖、选择完整 MSBuild 和 SDK、使用 NuGet 中的 .NET Framework 4.8 引用程序集，然后注入 Client ID 并编译。无论成功还是失败，最后都会恢复源码配置。输出为 `artifacts/Release/PCL-Kamitsubaki.exe` 和 `SHA256SUMS.txt`，运行需要 Windows 上的 .NET Framework 4.8。
+
+旧式 WPF 项目应通过上述完整 MSBuild 流程构建；单独使用 `dotnet build` 会遗漏此项目所需的 XAML 生成步骤。
 
 GitHub 构建工作流仅允许手动触发，不会自动发布 EXE。构建前在仓库 Settings → Secrets and variables → Actions 中设置 `CLIENT_ID`，工作流会将它写入待嵌入的配置文件。公开源码中的 `MicrosoftClientId` 留空；本地调试可设置环境变量 `PCL_MS_CLIENT_ID`。配置和功能限制见：
 

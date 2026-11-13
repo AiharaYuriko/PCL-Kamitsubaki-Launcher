@@ -6,7 +6,7 @@
 
 `Plain Craft Launcher 2/PCL.Online.json` 会嵌入 EXE，公开源码中的 `MicrosoftClientId` 留空。在 GitHub 仓库 Settings → Secrets and variables → Actions 中设置 `CLIENT_ID`；手动运行 Build 工作流时，它通过环境变量传给 `scripts/Set-BuildClientId.ps1`，仅修改构建工作区中的配置。缺少或无效的 ID 会使构建提前失败。
 
-本地调试可设置环境变量 `PCL_MS_CLIENT_ID`。本地打包可先设置该变量，再运行 `./scripts/Set-BuildClientId.ps1`，构建后恢复配置中的空值，不要提交注入后的文件。玩家使用构建后的 EXE 无需设置环境变量。EXE 同目录的同名 JSON 可整体覆盖嵌入配置（应包含全部字段）；环境变量优先级最高，修改后重启生效。
+本地调试可设置环境变量 `PCL_MS_CLIENT_ID`。本地打包在设置该变量后运行 `./scripts/Build-Launcher.ps1 -Configuration Release`；脚本负责注入、完整 WPF 编译，并在退出时自动恢复源码配置。玩家使用构建后的 EXE 无需设置环境变量。EXE 同目录的同名 JSON 可整体覆盖嵌入配置（应包含全部字段）；环境变量优先级最高，修改后重启生效。
 
 | JSON 字段 | 环境变量 | 含义 |
 | --- | --- | --- |
@@ -56,4 +56,6 @@ MicrosoftClientId 由构建流程注入，Minecraft 应用审核与真实登录�
 
 ## 验证
 
-`dotnet run --project Tests/Online.Tests/Online.Tests.vbproj -c Release` 使用模拟网络检查缺少 Client ID、产品隔离、错误哈希拒绝、正确哈希暂存、HTTP 拒绝、公告重要性筛选与去重、关闭联网设置。不会运行或替换真实启动器。未验证真实微软账号授权、线上下载以及 Windows 下的退出替换全流程；发布前需在可构建 WPF 的环境完成整机验证。
+`dotnet run --project Tests/Online.Tests/Online.Tests.vbproj -c Release` 使用模拟网络检查缺少 Client ID、产品隔离、错误哈希拒绝、正确哈希暂存、HTTP 拒绝、公告重要性筛选与去重、关闭联网设置，以及临时文件的替换与备份。
+
+2026-11-07：完整 Windows Release 构建成功，独立 EXE 的主界面、实例设置、整合包更新页面和正常退出已检查；确认 Client ID 已嵌入且源码配置恢复为空。在线服务测试及整合包更新器 11 项回归测试通过。真实微软账号授权、线上下载和运行中启动器的自更新全流程仍待验证。
