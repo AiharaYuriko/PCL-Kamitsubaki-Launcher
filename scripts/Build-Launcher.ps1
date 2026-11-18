@@ -40,10 +40,13 @@ try {
 
     $nugetRoot = if ($env:NUGET_PACKAGES) { $env:NUGET_PACKAGES } else { Join-Path $env:USERPROFILE '.nuget/packages' }
     $referencePackage = Join-Path $nugetRoot 'microsoft.netframework.referenceassemblies.net48'
-    $referenceRoot = Get-ChildItem -LiteralPath $referencePackage -Directory | Sort-Object { [Version]$_.Name } -Descending |
-        ForEach-Object { Join-Path $_.FullName 'build' } |
-        Where-Object { Test-Path (Join-Path $_ '.NETFramework/v4.8/mscorlib.dll') } | Select-Object -First 1
-    if (-not $referenceRoot) { throw '.NET Framework 4.8 reference assemblies were not restored.' }
+    $referenceRoot = Join-Path ${env:ProgramFiles(x86)} 'Reference Assemblies/Microsoft/Framework'
+    if (-not (Test-Path (Join-Path $referenceRoot '.NETFramework/v4.8/mscorlib.dll'))) {
+        $referenceRoot = Get-ChildItem -LiteralPath $referencePackage -Directory -ErrorAction SilentlyContinue |
+            Sort-Object { [Version]$_.Name } -Descending | ForEach-Object { Join-Path $_.FullName 'build' } |
+            Where-Object { Test-Path (Join-Path $_ '.NETFramework/v4.8/mscorlib.dll') } | Select-Object -First 1
+        if (-not $referenceRoot) { throw 'Install the .NET Framework 4.8 targeting pack or restore the net48 reference assemblies package.' }
+    }
 
     & "$PSScriptRoot/Set-BuildClientId.ps1" -ConfigPath $configPath
     & $msbuild 'Plain Craft Launcher 2/Plain Craft Launcher 2.vbproj' /t:Rebuild "/p:Configuration=$Configuration" "/p:TargetFrameworkRootPath=$referenceRoot\" /m:1 /v:minimal /nologo
