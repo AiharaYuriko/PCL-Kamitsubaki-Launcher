@@ -46,14 +46,16 @@ Public Class PageInstancePackPublish
             PublishFolders.Text = If(CStr(Saved("folders")), String.Join("; ", PackPublisher.DefaultFolders))
             PublishAccount.Text = CStr(Saved("account"))
             PublishBucket.Text = CStr(Saved("bucket"))
-            PublishRoot.Text = CStr(Saved("root"))
+            Dim SavedRoot = CStr(Saved("root"))
+            PublishRoot.Text = If(String.IsNullOrWhiteSpace(SavedRoot), ModPackUpdate.DefaultPackSource, SavedRoot)
             Dim Credentials = Publisher.ReadCredentials()
             PublishAccess.Text = CStr(Credentials("access"))
             PublishSecret.Password = If(CStr(Credentials("secret")), "")
             PublishRemember.Checked = Credentials.HasValues
-            If Publisher.Latest.HasValues AndAlso Not String.IsNullOrWhiteSpace(PublishRoot.Text) Then
-                PublishedAddress = PublishRoot.Text.TrimEnd("/"c) & "/pcl/index.json"
-                PublishStatus.Text = "最近发布 " & CStr(Publisher.Latest("release")("id")) & " · " & PublishedAddress
+            Dim Latest = Publisher.Latest
+            PublishedAddress = PackPublisher.PublishedSource(Latest)
+            If Not String.IsNullOrEmpty(PublishedAddress) Then
+                PublishStatus.Text = "最近发布 " & CStr(Latest("release")("id")) & " · " & PublishedAddress
             Else
                 PublishStatus.Text = If(Publisher.HasBaseline, "已保存旧整合包基线。", "先扫描原始实例，再保存基线。")
             End If
@@ -213,8 +215,8 @@ Public Class PageInstancePackPublish
                         Publisher.SaveCredentials(If(Remember, Settings.AccessKey, ""), If(Remember, Settings.SecretKey, ""))
                         Dim Result = New PackR2Publisher(Publisher).Publish(Info, Settings, PreviewFiles, Sub(Message) RunInUi(Sub() PublishStatus.Text = Message))
                         RunInUi(Sub()
-                                    PublishedAddress = Result.IndexAddress
-                                    PublishStatus.Text = "发布成功。" & vbCrLf & Result.IndexAddress
+                                    PublishedAddress = Result.SourceAddress
+                                    PublishStatus.Text = "发布成功。" & vbCrLf & PublishedAddress
                                     If Not Result.SupportsRanges Then PublishStatus.Text &= vbCrLf & "分段探测失败，玩家需要时可选择下载完整 ZIP。"
                                 End Sub)
                     End If

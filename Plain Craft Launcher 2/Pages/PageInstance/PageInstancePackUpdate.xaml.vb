@@ -22,8 +22,9 @@ Public Class PageInstancePackUpdate
         InitializeComponent()
         Target = Instance
         Updater = New PackUpdater(Instance.PathVersion)
-        Source.Text = CStr(Updater.Binding("source"))
-        Status.Text = "首次使用：输入更新源地址。本次更新前会备份受影响文件，只保留最近一次备份。"
+        Dim SavedSource = CStr(Updater.Binding("source"))
+        Source.Text = If(String.IsNullOrWhiteSpace(SavedSource), ModPackUpdate.DefaultPackSource, SavedSource)
+        Status.Text = "可以直接读取默认更新源，也可以输入服主提供的地址。"
         Restore.IsEnabled = Updater.HasBackup OrElse Updater.NeedsRecovery
         If Updater.NeedsRecovery Then Status.Text = "上次更新未完成，请先点击'恢复上次更新'。恢复前暂时不能启动游戏。"
         AddHandler ReadSource.Click, Async Sub() Await LoadSource()
@@ -61,7 +62,7 @@ Public Class PageInstancePackUpdate
         SetBusy(True)
         Try
             Dim Address = Source.Text.Trim()
-            Dim Index = Await Task.Run(Function() PackUpdater.GetIndex(Address))
+            Dim Index = Await Task.Run(Function() PackUpdater.GetIndex(Updater.ResolveIndexAddress(Address)))
             Choices.Items.Clear()
             For Each Pack As JObject In Index("packs")
                 For Each Channel As JObject In Pack("channels")

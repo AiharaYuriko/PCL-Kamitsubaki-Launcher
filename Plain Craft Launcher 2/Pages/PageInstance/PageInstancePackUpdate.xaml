@@ -9,7 +9,7 @@
                     <TextBlock Text="粘贴服主提供的地址，即可检查此实例的整合包更新。" TextWrapping="Wrap" Margin="0,0,0,12" />
                     <Grid Margin="0,0,0,12">
                         <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
-                        <local:MyTextBox x:Name="Source" HintText="https://更新服务器/pcl/index.json" Margin="0,0,12,0" Height="35" VerticalContentAlignment="Center" />
+                        <local:MyTextBox x:Name="Source" HintText="https://下载域名/桶内目录" Margin="0,0,12,0" Height="35" VerticalContentAlignment="Center" />
                         <local:MyButton x:Name="ReadSource" Grid.Column="1" Text="读取更新源" Width="120" Height="35" />
                     </Grid>
                     <local:MyComboBox x:Name="Choices" Height="30" />

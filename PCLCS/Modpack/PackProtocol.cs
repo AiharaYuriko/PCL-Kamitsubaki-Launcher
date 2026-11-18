@@ -31,6 +31,15 @@ public static class PackProtocol {
         if (!Uri.TryCreate(address, UriKind.Absolute, out var uri) || uri.Scheme != "https" || string.IsNullOrEmpty(uri.Host) || uri.UserInfo.Length > 0 || uri.Fragment.Length > 0)
             throw new InvalidDataException("更新地址必须是 HTTPS 地址，且不能包含用户名、密码或片段。");
     }
+    internal const string IndexPath = "pcl/index.json";
+
+    internal static string IndexAddress(string source) {
+        Https(source);
+        var uri = new Uri(source);
+        if (uri.Query.Length != 0 || uri.AbsolutePath.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) return source;
+        return uri.GetLeftPart(UriPartial.Path).TrimEnd('/') + "/" + IndexPath;
+    }
+
     public static byte[] Fetch(string address, long max = 8 * 1024 * 1024) {
         using var output = new MemoryStream(); Download(address, output, max, null); return output.ToArray();
     }

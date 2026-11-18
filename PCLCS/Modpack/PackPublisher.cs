@@ -49,6 +49,14 @@ public sealed class PackPublisher(string root) {
     public void SaveSettings(JObject settings) => PackUpdater.Atomic(ProjectFile("settings.json"), settings);
     public bool HasBaseline => File.Exists(ProjectFile("baseline.json"));
     public JObject Latest => Read("latest.json");
+
+    public static string? PublishedSource(JObject manifest) {
+        string? archive = (string?)manifest["archive"]?["download_url"];
+        string? hash = (string?)manifest["archive"]?["sha256"];
+        if (archive == null || hash == null) return null;
+        string suffix = "/" + ArchiveKey(hash);
+        return archive.EndsWith(suffix, StringComparison.Ordinal) ? archive.Substring(0, archive.Length - suffix.Length) : null;
+    }
     public JObject ReadCredentials() {
         var saved = (string?)Read("credentials.json")["encrypted"];
         return saved == null ? new JObject() : PackProtocol.Parse(ProtectedData.Unprotect(Convert.FromBase64String(saved), null, DataProtectionScope.CurrentUser));

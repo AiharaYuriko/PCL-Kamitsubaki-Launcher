@@ -43,6 +43,37 @@ internal static partial class Program {
         };
     static void Main() {
         TestLegacyUpgrades();
+        Test("shared R2 source resolves to the same object key", root => {
+            var updater = new PackUpdater(root);
+            foreach (string prefix in new[] { "", "modpacks/kamitsubaki/" }) {
+                string source = "https://packs.example.com/" + prefix.TrimEnd('/');
+                var settings = new PackR2Settings {
+                    Account = new string('a', 32), Bucket = "packs", PublicRoot = source,
+                    AccessKey = "key", SecretKey = "secret"
+                };
+                var address = settings.Validate();
+                string key = PackR2Publisher.ObjectKey(address, PackProtocol.IndexPath);
+                Assert(key == prefix + "pcl/index.json", "Incorrect bucket index key");
+                string index = "https://packs.example.com/" + key;
+                Assert(updater.ResolveIndexAddress(source) == index, "Shared address did not resolve to the uploaded index");
+                Assert(updater.ResolveIndexAddress(index) == index, "Direct JSON address was rewritten");
+                updater.Bind(source, "test", "stable");
+                Assert((string?)updater.Binding["source"] == source && updater.ResolveIndexAddress(source) == index, "Binding lost the shared address or its index");
+
+                string archiveKey = PackPublisher.ArchiveKey(new string('b', 64));
+                Assert(PackR2Publisher.ObjectKey(address, archiveKey) == prefix + archiveKey, "Archive escaped the bucket directory");
+                var manifest = new JObject { ["archive"] = new JObject {
+                    ["download_url"] = PackPublisher.PublicUrl(source, archiveKey), ["sha256"] = new string('b', 64)
+                } };
+                Assert(PackPublisher.PublishedSource(manifest) == source.TrimEnd('/'), "Could not copy the last published address");
+            }
+
+            const string legacy = "https://packs.example.com/custom-index";
+            Write(root, ".pcl-update/binding.json", new JObject { ["source"] = legacy, ["pack_id"] = "test", ["channel"] = "stable" }.ToString());
+            Assert(updater.ResolveIndexAddress(legacy) == legacy, "Existing extensionless index binding was rewritten");
+            updater.Bind(legacy, "test", "stable");
+            Assert(updater.ResolveIndexAddress(legacy) == legacy, "Rebinding changed the legacy index address");
+        });
         Test("update, preserve, cleanup and one backup", root => {
             var updater = new PackUpdater(root); Write(root, "options.txt", "player"); Write(root, "mods/personal.jar", "extra");
             Apply(updater, Release(1, FileEntry("config/a.toml", "one"), FileEntry("mods/old.jar", "old"), FileEntry("options.txt", "defaults", "preserve")));

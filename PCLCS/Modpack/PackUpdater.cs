@@ -47,12 +47,22 @@ public sealed partial class PackUpdater {
     public bool HasBackup => File.Exists(Work("previous/journal.json"));
     public JObject State => File.Exists(Work("state.json")) ? PackProtocol.Parse(File.ReadAllBytes(Work("state.json"))) : new JObject();
     public JObject Binding => File.Exists(Work("binding.json")) ? PackProtocol.Parse(File.ReadAllBytes(Work("binding.json"))) : new JObject();
+    public string ResolveIndexAddress(string source) {
+        var binding = Binding;
+        return string.Equals(source, (string?)binding["source"], StringComparison.Ordinal)
+            ? (string?)binding["index_url"] ?? source
+            : PackProtocol.IndexAddress(source);
+    }
     public void Bind(string source, string pack, string channel) {
         PackProtocol.Https(source);
         if (State["pack_id"] != null && ((string?)State["pack_id"] != pack || (string?)State["channel"] != channel)) throw new InvalidOperationException("此实例已有其他整合包或频道的更新记录，请使用独立实例。");
-        Atomic(Work("binding.json"), new JObject { ["source"] = source, ["pack_id"] = pack, ["channel"] = channel });
+        Atomic(Work("binding.json"), new JObject { ["source"] = source, ["index_url"] = ResolveIndexAddress(source), ["pack_id"] = pack, ["channel"] = channel });
     }
-    public static JObject GetIndex(string source) { var value = PackProtocol.Parse(PackProtocol.Fetch(source)); PackProtocol.Validate(value, "index"); return value; }
+    public static JObject GetIndex(string source) {
+        var value = PackProtocol.Parse(PackProtocol.Fetch(source));
+        PackProtocol.Validate(value, "index");
+        return value;
+    }
     public static JObject GetRelease(JObject pack, JObject channel) {
         var bytes = PackProtocol.Fetch((string)channel["manifest_url"]!);
         if (PackProtocol.Hash(bytes) != (string?)channel["manifest_sha256"]) throw new InvalidDataException("更新清单校验失败，请重新检查更新。");

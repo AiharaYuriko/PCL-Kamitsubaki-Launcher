@@ -38,7 +38,7 @@
                     <UniformGrid Columns="2">
                         <local:MyTextBox x:Name="PublishAccount" HintText="R2 Account ID" Margin="0,0,6,6" Height="32" />
                         <local:MyTextBox x:Name="PublishBucket" HintText="R2 存储桶名称" Margin="0,0,0,6" Height="32" />
-                        <local:MyTextBox x:Name="PublishRoot" HintText="https://整合包下载域名" Margin="0,0,6,6" Height="32" />
+                        <local:MyTextBox x:Name="PublishRoot" HintText="https://下载域名/桶内目录（目录可省略）" Margin="0,0,6,6" Height="32" />
                         <local:MyTextBox x:Name="PublishAccess" HintText="S3 Access Key ID" Margin="0,0,0,6" Height="32" />
                         <TextBlock Text="S3 Secret Access Key" VerticalAlignment="Center" />
                         <PasswordBox x:Name="PublishSecret" Margin="0,0,0,6" Height="32" VerticalContentAlignment="Center" />

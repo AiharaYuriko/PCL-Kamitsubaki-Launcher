@@ -15,27 +15,35 @@ public sealed class PackR2Settings {
     public string SecretKey { get; set; } = "";
     internal string Host => Account + ".r2.cloudflarestorage.com";
 
-    internal void Validate() {
+    internal Uri Validate() {
         if (!Regex.IsMatch(Account, @"^[a-f0-9]{32}(?:\.(?:eu|us|fedramp))?$") ||
             !Regex.IsMatch(Bucket, @"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"))
             throw new InvalidDataException("请检查 R2 Account ID 和存储桶名称。");
         PackProtocol.Https(PublicRoot);
-        var origin = new Uri(PublicRoot);
-        if (origin.AbsolutePath != "/" || origin.Query.Length != 0) throw new InvalidDataException("公开地址应为 R2 自定义域名的根地址。");
+        var address = new Uri(PublicRoot);
+        if (address.Query.Length != 0 || !Regex.IsMatch(address.AbsolutePath, @"^/(?:[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*/?)?\z"))
+            throw new InvalidDataException("公开地址应为 R2 自定义域名，可加桶内目录。目录名只能包含英文字母、数字、连字符和下划线。");
         if (!Regex.IsMatch(AccessKey, "^[a-zA-Z0-9]+$") || string.IsNullOrWhiteSpace(SecretKey))
             throw new InvalidDataException("请填写 R2 S3 Access Key ID 和 Secret Access Key。");
+        return address;
     }
 }
 
-public sealed record PackPublishResult(string IndexAddress, bool SupportsRanges);
+public sealed record PackPublishResult(string SourceAddress, bool SupportsRanges);
 
 public sealed class PackR2Publisher(PackPublisher publisher) {
-    private const string IndexKey = "pcl/index.json";
+    private const string IndexKey = PackProtocol.IndexPath;
+
+    internal static string ObjectKey(Uri address, string key) {
+        string prefix = address.AbsolutePath.Trim('/');
+        return prefix.Length == 0 ? key : prefix + "/" + key;
+    }
 
     public PackPublishResult Publish(PackPublishDetails details, PackR2Settings settings, IReadOnlyList<PackPublishFile> files, Action<string> progress) {
-        settings.Validate();
+        var address = settings.Validate();
+        string publicRoot = address.GetLeftPart(UriPartial.Path).TrimEnd('/');
         PackPublisher.ValidateDetails(details);
-        using var r2 = new R2Objects(settings);
+        using var r2 = new R2Objects(settings, address);
         var previous = r2.Read(IndexKey);
         var index = previous.Bytes != null ? PackProtocol.Parse(previous.Bytes) : new JObject {
             ["schema"] = "pcl.modpack.index.v1", ["name"] = details.Name, ["packs"] = new JArray()
@@ -58,12 +66,12 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
         string local = publisher.ProjectFile("release.zip");
         try {
             progress("正在生成并校验完整 ZIP……");
-            var manifest = publisher.Build(details, files, sequence, local, settings.PublicRoot);
+            var manifest = publisher.Build(details, files, sequence, local, publicRoot);
             byte[] bytes = JsonBytes(manifest);
             if (bytes.Length > 8 * 1024 * 1024) throw new IOException("版本清单超过客户端的下载上限。");
             string manifestHash = PackProtocol.Hash(bytes);
             string manifestKey = $"pcl/{details.PackId}/{details.Channel}/releases/{details.ReleaseId}.json";
-            string manifestUrl = PackPublisher.PublicUrl(settings.PublicRoot, manifestKey);
+            string manifestUrl = PackPublisher.PublicUrl(publicRoot, manifestKey);
             if (retry && (string?)current?["manifest_sha256"] != manifestHash)
                 throw new IOException("该发布 ID 已经上线。请为不同内容使用新的发布 ID。");
             string archiveHash = (string)manifest["archive"]!["sha256"]!;
@@ -100,7 +108,7 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
                 }
             }
             publisher.Remember(manifest);
-            return new PackPublishResult(PackPublisher.PublicUrl(settings.PublicRoot, IndexKey), supportsRanges);
+            return new PackPublishResult(publicRoot, supportsRanges);
         } finally {
             if (File.Exists(local)) File.Delete(local);
         }
@@ -108,7 +116,7 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
 
     internal static byte[] JsonBytes(JObject value) => Encoding.UTF8.GetBytes(value.ToString(Formatting.None));
 
-    private sealed class R2Objects(PackR2Settings settings) : IDisposable {
+    private sealed class R2Objects(PackR2Settings settings, Uri address) : IDisposable {
         private const int PartSize = 32 * 1024 * 1024;
         private const string ImmutableCache = "public, max-age=31536000, immutable";
         private static readonly HttpMethod Head = new("HEAD");
@@ -235,7 +243,7 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
             string day = time.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
             string stamp = time.ToString("yyyyMMdd'T'HHmmss'Z'", CultureInfo.InvariantCulture);
             string payload = PackProtocol.Hash(body ?? Array.Empty<byte>());
-            string path = "/" + settings.Bucket + "/" + string.Join("/", key.Split('/').Select(Uri.EscapeDataString));
+            string path = "/" + settings.Bucket + "/" + string.Join("/", ObjectKey(address, key).Split('/').Select(Uri.EscapeDataString));
             var headers = new SortedDictionary<string, string>(StringComparer.Ordinal) {
                 ["host"] = settings.Host, ["x-amz-content-sha256"] = payload, ["x-amz-date"] = stamp
             };
