@@ -32,6 +32,7 @@ Public Class PageInstancePackPublish
         AddHandler PublishNow.Click, Sub() SubmitPublication(False)
         AddHandler PublishExport.Click, Sub() SubmitPublication(True)
         AddHandler PublishCopy.Click, Sub() Clipboard.SetText(PublishedAddress)
+        AddHandler PublishMirror.Change, Sub() PublishMirrorCredentials.IsEnabled = PublishMirror.Checked
         AddHandler PublishFolders.TextChanged,
             Sub()
                 DraftFiles = Nothing
@@ -51,7 +52,12 @@ Public Class PageInstancePackPublish
             Dim Credentials = Publisher.ReadCredentials()
             PublishAccess.Text = CStr(Credentials("access"))
             PublishSecret.Password = If(CStr(Credentials("secret")), "")
-            PublishRemember.Checked = Credentials.HasValues
+            PublishMirror.Checked = If(CType(Saved("sync_mirror"), Boolean?), True)
+            PublishMirrorCredentials.IsEnabled = PublishMirror.Checked
+            Dim MirrorCredentials = Publisher.ReadCredentials(mirror:=True)
+            PublishMirrorAccess.Text = CStr(MirrorCredentials("access"))
+            PublishMirrorSecret.Password = If(CStr(MirrorCredentials("secret")), "")
+            PublishRemember.Checked = Credentials.HasValues OrElse MirrorCredentials.HasValues
             Dim Latest = Publisher.Latest
             PublishedAddress = PackPublisher.PublishedSource(Latest)
             If Not String.IsNullOrEmpty(PublishedAddress) Then
@@ -183,7 +189,8 @@ Public Class PageInstancePackPublish
         If ExportOnly Then
             Output = Dialogs.SaveFile("选择测试整合包保存路径", "pcl-test-pack.zip", filter:={("zip", "整合包 ZIP")})
             If String.IsNullOrEmpty(Output) Then Return
-        ElseIf MyMsgBox("上传完整 ZIP 与清单并切换正式频道？切换成功后，绑定此频道的玩家将看到本版本。",
+        ElseIf MyMsgBox(If(PublishMirror.Checked, "发布到 R2 后自动同步私有 S3，并验证备用签名入口。是否继续？",
+                       "上传完整 ZIP 与清单并切换正式频道？切换成功后，绑定此频道的玩家将看到本版本。"),
                        "发布整合包", "发布", "取消") <> 1 Then
             Return
         End If
@@ -196,8 +203,11 @@ Public Class PageInstancePackPublish
             .Account = PublishAccount.Text.Trim(), .Bucket = PublishBucket.Text.Trim(), .PublicRoot = PublishRoot.Text.Trim(),
             .AccessKey = PublishAccess.Text.Trim(), .SecretKey = PublishSecret.Password
         }
+        Dim MirrorSettings = If(PublishMirror.Checked AndAlso Not ExportOnly, New PackS3MirrorSettings With {
+            .AccessKey = PublishMirrorAccess.Text.Trim(), .SecretKey = PublishMirrorSecret.Password
+        }, Nothing)
         Dim Persist = New JObject From {{"name", Info.Name}, {"id", Info.PackId}, {"channel", Info.Channel}, {"folders", PublishFolders.Text},
-            {"account", Settings.Account}, {"bucket", Settings.Bucket}, {"root", Settings.PublicRoot}}
+            {"account", Settings.Account}, {"bucket", Settings.Bucket}, {"root", Settings.PublicRoot}, {"sync_mirror", PublishMirror.Checked}}
         Dim Remember = PublishRemember.Checked
         SetBusy(True)
         Dim Worker As New RedoableWorker(
@@ -213,11 +223,23 @@ Public Class PageInstancePackPublish
                         RunInUi(Sub() PublishStatus.Text = "测试 ZIP 已导出：" & Output)
                     Else
                         Publisher.SaveCredentials(If(Remember, Settings.AccessKey, ""), If(Remember, Settings.SecretKey, ""))
-                        Dim Result = New PackR2Publisher(Publisher).Publish(Info, Settings, PreviewFiles, Sub(Message) RunInUi(Sub() PublishStatus.Text = Message))
+                        If MirrorSettings IsNot Nothing Then
+                            Publisher.SaveCredentials(If(Remember, MirrorSettings.AccessKey, ""), If(Remember, MirrorSettings.SecretKey, ""), mirror:=True)
+                        ElseIf Not Remember Then
+                            Publisher.SaveCredentials("", "", mirror:=True)
+                        End If
+                        Dim Result = New PackR2Publisher(Publisher).Publish(Info, Settings, PreviewFiles, Sub(Message) RunInUi(Sub() PublishStatus.Text = Message), MirrorSettings)
                         RunInUi(Sub()
                                     PublishedAddress = Result.SourceAddress
-                                    PublishStatus.Text = "发布成功。" & vbCrLf & PublishedAddress
-                                    If Not Result.SupportsRanges Then PublishStatus.Text &= vbCrLf & "分段探测失败，玩家需要时可选择下载完整 ZIP。"
+                                    PublishStatus.Text = "R2 发布成功 · " & PublishedAddress
+                                    If MirrorSettings IsNot Nothing Then
+                                        If Result.MirrorError Is Nothing Then
+                                            PublishStatus.Text &= vbCrLf & "私有 S3 同步成功 · " & PackS3MirrorSettings.SourceAddress
+                                        Else
+                                            PublishStatus.Text &= vbCrLf & "私有 S3 同步未完成：" & Result.MirrorError & vbCrLf & "可用同一发布 ID 和相同内容重试。"
+                                        End If
+                                    End If
+                                    If Not Result.SupportsRanges Then PublishStatus.Text &= vbCrLf & "R2 分段探测失败，玩家需要时可选择下载完整 ZIP。"
                                 End Sub)
                     End If
                 Catch ex As Exception

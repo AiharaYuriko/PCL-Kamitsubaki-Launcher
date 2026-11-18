@@ -29,21 +29,40 @@ public sealed class PackR2Settings {
     }
 }
 
-public sealed record PackPublishResult(string SourceAddress, bool SupportsRanges);
+public sealed class PackS3MirrorSettings {
+    public const string SourceAddress = "https://s3-sign.kaf.mom";
+    internal const string Host = "fgws3-ocloud.ihep.ac.cn";
+    internal const string Bucket = "21045-yrrt-174027";
+    internal const string Prefix = "pcl-mirror";
+    internal const string Region = "us-east-1";
+    public string AccessKey { get; set; } = "";
+    public string SecretKey { get; set; } = "";
+
+    internal void Validate() {
+        if (!Regex.IsMatch(AccessKey, @"\A[a-zA-Z0-9]+\z") || string.IsNullOrWhiteSpace(SecretKey))
+            throw new InvalidDataException("请填写私有 S3 备用桶的发布凭据。");
+    }
+}
+
+public sealed record PackPublishResult(string SourceAddress, bool SupportsRanges) {
+    public string? MirrorError { get; init; }
+}
 
 public sealed class PackR2Publisher(PackPublisher publisher) {
     private const string IndexKey = PackProtocol.IndexPath;
+    private const string MirrorLockKey = "pcl/mirror-index-lock.json";
+    private const int ManifestLimit = 8 * 1024 * 1024;
 
-    internal static string ObjectKey(Uri address, string key) {
-        string prefix = address.AbsolutePath.Trim('/');
-        return prefix.Length == 0 ? key : prefix + "/" + key;
-    }
+    internal static string ObjectKey(Uri address, string key) => ObjectKey(address.AbsolutePath.Trim('/'), key);
+    private static string ObjectKey(string prefix, string key) => prefix.Length == 0 ? key : prefix + "/" + key;
 
-    public PackPublishResult Publish(PackPublishDetails details, PackR2Settings settings, IReadOnlyList<PackPublishFile> files, Action<string> progress) {
+    public PackPublishResult Publish(PackPublishDetails details, PackR2Settings settings, IReadOnlyList<PackPublishFile> files, Action<string> progress,
+        PackS3MirrorSettings? mirror = null) {
         var address = settings.Validate();
         string publicRoot = address.GetLeftPart(UriPartial.Path).TrimEnd('/');
         PackPublisher.ValidateDetails(details);
-        using var r2 = new R2Objects(settings, address);
+        mirror?.Validate();
+        using var r2 = new S3Objects(settings.Host, settings.Bucket, address.AbsolutePath.Trim('/'), "auto", settings.AccessKey, settings.SecretKey, "R2", true);
         var previous = r2.Read(IndexKey);
         var index = previous.Bytes != null ? PackProtocol.Parse(previous.Bytes) : new JObject {
             ["schema"] = "pcl.modpack.index.v1", ["name"] = details.Name, ["packs"] = new JArray()
@@ -68,9 +87,9 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
             progress("正在生成并校验完整 ZIP……");
             var manifest = publisher.Build(details, files, sequence, local, publicRoot);
             byte[] bytes = JsonBytes(manifest);
-            if (bytes.Length > 8 * 1024 * 1024) throw new IOException("版本清单超过客户端的下载上限。");
+            if (bytes.Length > ManifestLimit) throw new IOException("版本清单超过客户端的下载上限。");
             string manifestHash = PackProtocol.Hash(bytes);
-            string manifestKey = $"pcl/{details.PackId}/{details.Channel}/releases/{details.ReleaseId}.json";
+            string manifestKey = PackPublisher.ManifestKey(details.PackId, details.Channel, details.ReleaseId);
             string manifestUrl = PackPublisher.PublicUrl(publicRoot, manifestKey);
             if (retry && (string?)current?["manifest_sha256"] != manifestHash)
                 throw new IOException("该发布 ID 已经上线。请为不同内容使用新的发布 ID。");
@@ -93,10 +112,10 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
                 supportsRanges = false;
                 progress("当前域名的分段探测失败，玩家可使用完整 ZIP：" + ex.Message);
             }
+            var pointer = new JObject { ["id"] = details.Channel, ["release_id"] = details.ReleaseId, ["sequence"] = sequence,
+                ["manifest_url"] = manifestUrl, ["manifest_sha256"] = manifestHash };
             if (!retry) {
                 pack["name"] = details.Name;
-                var pointer = new JObject { ["id"] = details.Channel, ["release_id"] = details.ReleaseId, ["sequence"] = sequence,
-                    ["manifest_url"] = manifestUrl, ["manifest_sha256"] = manifestHash };
                 if (current == null) channels.Add(pointer);
                 else current.Replace(pointer);
                 PackProtocol.Validate(index, "index");
@@ -108,17 +127,108 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
                 }
             }
             publisher.Remember(manifest);
-            return new PackPublishResult(publicRoot, supportsRanges);
+            var result = new PackPublishResult(publicRoot, supportsRanges);
+            if (mirror != null) {
+                try {
+                    SyncMirror(r2, mirror, details, pointer, bytes, local, size, archiveHash, progress);
+                } catch (Exception ex) when (ex is IOException or InvalidDataException or HttpRequestException or OperationCanceledException or
+                    UnauthorizedAccessException or JsonException or System.Xml.XmlException) {
+                    result = result with { MirrorError = ex.Message };
+                }
+            }
+            return result;
         } finally {
             if (File.Exists(local)) File.Delete(local);
         }
     }
 
+    private void SyncMirror(S3Objects r2, PackS3MirrorSettings settings, PackPublishDetails details, JObject pointer, byte[] manifest,
+        string local, long size, string archiveHash, Action<string> progress) {
+        using var s3 = new S3Objects(PackS3MirrorSettings.Host, PackS3MirrorSettings.Bucket, PackS3MirrorSettings.Prefix,
+            PackS3MirrorSettings.Region, settings.AccessKey, settings.SecretKey, "备用 S3", false);
+        string archiveKey = PackPublisher.ArchiveKey(archiveHash);
+        string manifestKey = PackPublisher.ManifestKey(details.PackId, details.Channel, details.ReleaseId);
+        string manifestHash = (string)pointer["manifest_sha256"]!;
+        progress("R2 已发布，正在同步到私有 S3……");
+        s3.PutArchive(archiveKey, local, size, archiveHash, progress);
+        s3.PutImmutable(manifestKey, manifest);
+        progress("正在验证备用线路的预签名下载……");
+        if (PackProtocol.Hash(PackProtocol.Fetch(PackPublisher.PublicUrl(PackS3MirrorSettings.SourceAddress, manifestKey), ManifestLimit, true)) != manifestHash)
+            throw new IOException("备用线路返回的版本清单与 R2 不一致。");
+        using var probe = new MemoryStream();
+        PackProtocol.DownloadRange(PackPublisher.PublicUrl(PackS3MirrorSettings.SourceAddress, archiveKey), probe, 0, 2, size, true, null);
+        if (!probe.ToArray().SequenceEqual(new byte[] { 0x50, 0x4b })) throw new IOException("备用线路的 ZIP 分段校验失败。");
+
+        // OSCA accepts conditional PUT headers without enforcing them. Serialize only the index update through R2.
+        using var ownerFile = new FileStream(publisher.ProjectFile("mirror-lock.id"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        string owner = ReadLockOwner(ownerFile);
+        var previous = r2.Read(MirrorLockKey);
+        string? activeOwner = previous.Bytes == null ? null : (string?)PackProtocol.Parse(previous.Bytes)["owner"];
+        if (activeOwner != owner) {
+            if (!string.IsNullOrEmpty(activeOwner)) throw new IOException("另一个发布项目正在切换备用频道，请稍后重试。若此前发布中断，请从原实例重试以恢复。");
+            r2.PutIndex(MirrorLockKey, JsonBytes(new JObject { ["owner"] = owner }), previous.ETag);
+        }
+        try {
+            if (!r2.PointsTo(IndexKey, details, manifestHash)) throw new IOException("R2 频道已改变，请在正式发布页核对当前发布后重试。");
+            progress("正在切换备用 S3 频道……");
+            var previousMirror = s3.Read(IndexKey).Bytes;
+            var mirrorIndex = UpdateMirrorIndex(previousMirror, details.Name, details.PackId, pointer);
+            byte[] indexBytes = JsonBytes(mirrorIndex);
+            if (indexBytes.Length > ManifestLimit) throw new IOException("备用频道目录超过客户端的下载上限。");
+            if (previousMirror?.SequenceEqual(indexBytes) != true) s3.PutIndex(IndexKey, indexBytes, null);
+            if (!PackProtocol.Fetch(PackPublisher.PublicUrl(PackS3MirrorSettings.SourceAddress, IndexKey), ManifestLimit, true).SequenceEqual(indexBytes))
+                throw new IOException("预签名入口返回的频道目录与备用桶不同。");
+        } finally {
+            var locked = r2.Read(MirrorLockKey);
+            if (locked.Bytes != null && (string?)PackProtocol.Parse(locked.Bytes)["owner"] == owner)
+                r2.PutIndex(MirrorLockKey, JsonBytes(new JObject { ["owner"] = "" }), locked.ETag);
+        }
+    }
+
+    private static string ReadLockOwner(FileStream file) {
+        using var reader = new StreamReader(file, Encoding.UTF8, false, 128, leaveOpen: true);
+        string? saved = reader.ReadLine();
+        if (Guid.TryParseExact(saved, "N", out _)) return saved!;
+        string owner = Guid.NewGuid().ToString("N");
+        file.Position = 0;
+        file.SetLength(0);
+        byte[] bytes = Encoding.ASCII.GetBytes(owner);
+        file.Write(bytes, 0, bytes.Length);
+        file.Flush(flushToDisk: true);
+        return owner;
+    }
+
+    internal static JObject UpdateMirrorIndex(byte[]? previous, string name, string packId, JObject pointer) {
+        var index = previous == null ? new JObject { ["schema"] = "pcl.modpack.index.v1", ["name"] = name, ["packs"] = new JArray() }
+            : PackProtocol.Parse(previous);
+        PackProtocol.Validate(index, "index");
+        var packs = (JArray)index["packs"]!;
+        var pack = packs.OfType<JObject>().SingleOrDefault(item => (string?)item["id"] == packId);
+        if (pack == null) {
+            pack = new JObject { ["id"] = packId, ["name"] = name, ["channels"] = new JArray() };
+            packs.Add(pack);
+        }
+        var channels = (JArray)pack["channels"]!;
+        var channel = channels.OfType<JObject>().SingleOrDefault(item => (string?)item["id"] == (string?)pointer["id"]);
+        if (channel != null) {
+            long currentSequence = (long)channel["sequence"]!;
+            long newSequence = (long)pointer["sequence"]!;
+            if (currentSequence > newSequence || currentSequence == newSequence && !JToken.DeepEquals(channel, pointer))
+                throw new IOException("备用频道已存在更新的版本或冲突的发布序号。");
+            channel.Replace(pointer.DeepClone());
+        } else channels.Add(pointer.DeepClone());
+        pack["name"] = name;
+        PackProtocol.Validate(index, "index");
+        return index;
+    }
+
     internal static byte[] JsonBytes(JObject value) => Encoding.UTF8.GetBytes(value.ToString(Formatting.None));
 
-    private sealed class R2Objects(PackR2Settings settings, Uri address) : IDisposable {
+    private sealed class S3Objects(string host, string bucket, string prefix, string region, string accessKey, string secretKey,
+        string label, bool conditionalWrites) : IDisposable {
         private const int PartSize = 32 * 1024 * 1024;
-        private const string ImmutableCache = "public, max-age=31536000, immutable";
+        private string CacheForImmutable => conditionalWrites ? "public, max-age=31536000, immutable" : "private, no-store";
+        private string? NewObjectCondition => conditionalWrites ? "if-none-match" : null;
         private static readonly HttpMethod Head = new("HEAD");
         private readonly HttpClient client = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromMinutes(20) };
 
@@ -131,14 +241,14 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
             var buffer = new byte[64 * 1024];
             int read;
             while ((read = input.Read(buffer, 0, buffer.Length)) > 0) {
-                if (output.Length + read > 8 * 1024 * 1024) throw new IOException("R2 清单超过下载限制。");
+                if (output.Length + read > ManifestLimit) throw new IOException(label + " 清单超过下载限制。");
                 output.Write(buffer, 0, read);
             }
-            return (output.ToArray(), response.Headers.ETag?.ToString() ?? throw new IOException("R2 未返回清单 ETag。"));
+            return (output.ToArray(), response.Headers.ETag?.ToString() ?? throw new IOException(label + " 未返回清单 ETag。"));
         }
         internal void PutIndex(string key, byte[] bytes, string? etag) {
             using var response = Send(HttpMethod.Put, key, body: bytes, type: "application/json", cache: "no-store",
-                condition: etag == null ? "if-none-match" : "if-match", conditionValue: etag ?? "*");
+                condition: conditionalWrites ? (etag == null ? "if-none-match" : "if-match") : null, conditionValue: etag ?? "*");
             if (response.StatusCode == HttpStatusCode.PreconditionFailed)
                 throw new IOException("频道已被其他发布修改，请重新读取后重试。");
             Ensure(response, "切换频道");
@@ -157,8 +267,12 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
             }
         }
         internal void PutImmutable(string key, byte[] bytes) {
-            using var response = Send(HttpMethod.Put, key, body: bytes, type: "application/json", cache: ImmutableCache,
-                condition: "if-none-match", conditionValue: "*");
+            if (!conditionalWrites && Read(key).Bytes is byte[] previous) {
+                if (previous.SequenceEqual(bytes)) return;
+                throw new IOException("同一发布 ID 已有不同的备用清单，请使用新的发布 ID。");
+            }
+            using var response = Send(HttpMethod.Put, key, body: bytes, type: "application/json", cache: CacheForImmutable,
+                condition: NewObjectCondition, conditionValue: "*");
             if (response.StatusCode == HttpStatusCode.PreconditionFailed) {
                 if (Read(key).Bytes?.SequenceEqual(bytes) == true) return;
                 throw new IOException("同一发布 ID 已有不同的清单，请使用新的发布 ID。");
@@ -169,20 +283,21 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
         internal void PutArchive(string key, string path, long size, string hash, Action<string> progress) {
             if (HasArchive(key, size, hash)) return;
             if (size <= PartSize) {
-                using var put = Send(HttpMethod.Put, key, body: File.ReadAllBytes(path), type: "application/zip", cache: ImmutableCache,
-                    condition: "if-none-match", conditionValue: "*", metadata: hash);
+                using var put = Send(HttpMethod.Put, key, body: File.ReadAllBytes(path), type: "application/zip", cache: CacheForImmutable,
+                    condition: NewObjectCondition, conditionValue: "*", metadata: hash);
                 if (put.StatusCode == HttpStatusCode.PreconditionFailed && HasArchive(key, size, hash)) return;
                 Ensure(put, "上传 ZIP");
+                if (!conditionalWrites && !HasArchive(key, size, hash)) throw new IOException("备用 S3 未保存 ZIP。");
                 return;
             }
             long partSize = Math.Max(PartSize, (size + 9999) / 10000);
             if (partSize > 512 * 1024 * 1024) throw new IOException("ZIP 超过当前上传器支持的大小。");
-            using var create = Send(HttpMethod.Post, key, "uploads=", type: "application/zip", cache: ImmutableCache,
-                metadata: hash, condition: "if-none-match", conditionValue: "*");
+            using var create = Send(HttpMethod.Post, key, "uploads=", type: "application/zip", cache: CacheForImmutable,
+                metadata: hash, condition: NewObjectCondition, conditionValue: "*");
             if (create.StatusCode == HttpStatusCode.PreconditionFailed && HasArchive(key, size, hash)) return;
             Ensure(create, "初始化分片上传");
             string id = ReadXml(create).Elements().FirstOrDefault(e => e.Name.LocalName == "UploadId")?.Value
-                ?? throw new IOException("R2 未返回分片上传 ID。");
+                ?? throw new IOException(label + " 未返回分片上传 ID。");
             string upload = "uploadId=" + Uri.EscapeDataString(id);
             bool completed = false;
             try {
@@ -202,11 +317,12 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
                     parts.Add(new XElement("Part", new XElement("PartNumber", number), new XElement("ETag", etag)));
                 }
                 using var commit = Send(HttpMethod.Post, key, upload, Encoding.UTF8.GetBytes(parts.ToString(SaveOptions.DisableFormatting)),
-                    "application/xml", condition: "if-none-match", conditionValue: "*");
+                    "application/xml", condition: NewObjectCondition, conditionValue: "*");
                 if (commit.StatusCode == HttpStatusCode.PreconditionFailed && HasArchive(key, size, hash)) return;
                 Ensure(commit, "提交 ZIP 分片");
-                if (ReadXml(commit).Name.LocalName != "CompleteMultipartUploadResult") throw new IOException("R2 未确认 ZIP 分片提交。");
+                if (ReadXml(commit).Name.LocalName != "CompleteMultipartUploadResult") throw new IOException(label + " 未确认 ZIP 分片提交。");
                 completed = true;
+                if (!conditionalWrites && !HasArchive(key, size, hash)) throw new IOException("备用 S3 未保存 ZIP。");
             } finally {
                 if (!completed) {
                     try { using var abandon = Send(HttpMethod.Delete, key, upload); }
@@ -222,7 +338,7 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
                     using var put = Send(HttpMethod.Put, key, query, data);
                     if (attempt < 2 && ((int)put.StatusCode >= 500 || (int)put.StatusCode == 429)) continue;
                     Ensure(put, "上传 ZIP 分片");
-                    return put.Headers.ETag?.ToString() ?? throw new IOException("R2 未返回分片 ETag。");
+                    return put.Headers.ETag?.ToString() ?? throw new IOException(label + " 未返回分片 ETag。");
                 } catch (HttpRequestException) when (attempt < 2) { }
                 catch (OperationCanceledException) when (attempt < 2) { }
             }
@@ -233,7 +349,7 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
             if (response.StatusCode == HttpStatusCode.NotFound) return false;
             Ensure(response, "验证 ZIP 对象");
             if (response.Content.Headers.ContentLength != size || !response.Headers.TryGetValues("x-amz-meta-sha256", out var checksums) || !checksums.Contains(hash))
-                throw new IOException("R2 已有同名但校验信息不同的 ZIP。");
+                throw new IOException(label + " 已有同名但校验信息不同的 ZIP。");
             return true;
         }
 
@@ -243,21 +359,21 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
             string day = time.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
             string stamp = time.ToString("yyyyMMdd'T'HHmmss'Z'", CultureInfo.InvariantCulture);
             string payload = PackProtocol.Hash(body ?? Array.Empty<byte>());
-            string path = "/" + settings.Bucket + "/" + string.Join("/", ObjectKey(address, key).Split('/').Select(Uri.EscapeDataString));
+            string path = "/" + bucket + "/" + string.Join("/", ObjectKey(prefix, key).Split('/').Select(Uri.EscapeDataString));
             var headers = new SortedDictionary<string, string>(StringComparer.Ordinal) {
-                ["host"] = settings.Host, ["x-amz-content-sha256"] = payload, ["x-amz-date"] = stamp
+                ["host"] = host, ["x-amz-content-sha256"] = payload, ["x-amz-date"] = stamp
             };
             if (condition != null) headers[condition] = conditionValue!;
             if (metadata != null) headers["x-amz-meta-sha256"] = metadata;
             string signed = string.Join(";", headers.Keys);
             string canonical = method.Method + "\n" + path + "\n" + query + "\n" +
                 string.Concat(headers.Select(h => h.Key + ":" + h.Value + "\n")) + "\n" + signed + "\n" + payload;
-            string scope = day + "/auto/s3/aws4_request";
+            string scope = day + "/" + region + "/s3/aws4_request";
             string toSign = "AWS4-HMAC-SHA256\n" + stamp + "\n" + scope + "\n" + PackProtocol.Hash(Encoding.UTF8.GetBytes(canonical));
-            byte[] signingKey = Hmac(Hmac(Hmac(Hmac(Encoding.UTF8.GetBytes("AWS4" + settings.SecretKey), day), "auto"), "s3"), "aws4_request");
-            string authorization = "AWS4-HMAC-SHA256 Credential=" + settings.AccessKey + "/" + scope + ", SignedHeaders=" + signed +
+            byte[] signingKey = Hmac(Hmac(Hmac(Hmac(Encoding.UTF8.GetBytes("AWS4" + secretKey), day), region), "s3"), "aws4_request");
+            string authorization = "AWS4-HMAC-SHA256 Credential=" + accessKey + "/" + scope + ", SignedHeaders=" + signed +
                 ", Signature=" + PackProtocol.Hex(Hmac(signingKey, toSign));
-            using var request = new HttpRequestMessage(method, "https://" + settings.Host + path + (query.Length == 0 ? "" : "?" + query));
+            using var request = new HttpRequestMessage(method, "https://" + host + path + (query.Length == 0 ? "" : "?" + query));
             foreach (var header in headers) request.Headers.TryAddWithoutValidation(header.Key, header.Value);
             request.Headers.TryAddWithoutValidation("Authorization", authorization);
             if (cache != null) request.Headers.TryAddWithoutValidation("Cache-Control", cache);
@@ -272,8 +388,8 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
             using var algorithm = new HMACSHA256(key);
             return algorithm.ComputeHash(Encoding.UTF8.GetBytes(value));
         }
-        private static void Ensure(HttpResponseMessage response, string action) {
-            if (!response.IsSuccessStatusCode) throw new IOException($"R2 {action}失败（HTTP {(int)response.StatusCode}）。请检查凭据、桶权限和网络。");
+        private void Ensure(HttpResponseMessage response, string action) {
+            if (!response.IsSuccessStatusCode) throw new IOException($"{label} {action}失败（HTTP {(int)response.StatusCode}）。请检查凭据、桶权限和网络。");
         }
         public void Dispose() => client.Dispose();
     }

@@ -40,13 +40,20 @@ public static class PackProtocol {
         return uri.GetLeftPart(UriPartial.Path).TrimEnd('/') + "/" + IndexPath;
     }
 
-    public static byte[] Fetch(string address, long max = 8 * 1024 * 1024) {
-        using var output = new MemoryStream(); Download(address, output, max, null); return output.ToArray();
+    public static byte[] Fetch(string address, long max = 8 * 1024 * 1024) => Fetch(address, max, false);
+    internal static byte[] Fetch(string address, long max, bool failover) {
+        using var output = new MemoryStream();
+        Transfer(address, output, max, null, null, 0, failover);
+        return output.ToArray();
     }
     public static void Download(string address, Stream output, long max, Action<long>? progress) =>
         Transfer(address, output, max, progress, null, 0);
     internal static void DownloadRange(string address, Stream output, long offset, long length, long total) =>
         Transfer(address, output, length, null, offset, total);
+    internal static void DownloadRange(string address, Stream output, long offset, long length, long total, bool failover, PackArchiveLink? link) =>
+        Transfer(address, output, length, null, offset, total, failover, link);
+    internal static void Download(string address, Stream output, long max, Action<long>? progress, bool failover, PackArchiveLink? link) =>
+        Transfer(address, output, max, progress, null, 0, failover, link);
     internal static void CheckPublicSize(string address, long size) {
         Https(address);
         using var client = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(30) };
@@ -55,11 +62,18 @@ public static class PackProtocol {
         response.EnsureSuccessStatusCode();
         if (response.Content.Headers.ContentLength != size) throw new IOException("公开 ZIP 的大小与上传内容不一致。");
     }
-    private static void Transfer(string address, Stream output, long max, Action<long>? progress, long? offset, long objectSize) {
+    internal static void Transfer(string address, Stream output, long max, Action<long>? progress, long? offset, long objectSize,
+        bool failover = false, PackArchiveLink? link = null, HttpMessageHandler? messageHandler = null) {
         // Validate every redirect: an HTTPS URL may not redirect to a local file or HTTP.
-        using var handler = new HttpClientHandler { AllowAutoRedirect = false };
-        using var client = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) };
+        var idleTimeout = TimeSpan.FromSeconds(15);
+        using var client = new HttpClient(messageHandler ?? new HttpClientHandler { AllowAutoRedirect = false }, messageHandler == null) {
+            Timeout = failover ? idleTimeout : TimeSpan.FromMinutes(10)
+        };
         client.DefaultRequestHeaders.UserAgent.ParseAdd("PCL-Modpack/1.0");
+        string original = address;
+        string? reused = link?.Get(DateTimeOffset.UtcNow);
+        if (reused != null) address = reused;
+        Uri? signedRedirect = null;
         for (int redirect = 0; redirect < 6; redirect++) {
             Https(address);
             using var request = new HttpRequestMessage(HttpMethod.Get, address);
@@ -68,8 +82,16 @@ public static class PackProtocol {
                 request.Headers.AcceptEncoding.ParseAdd("identity");
             }
             using var response = client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
+            if (address == reused && (response.StatusCode == HttpStatusCode.Forbidden || response.StatusCode == HttpStatusCode.Unauthorized)) {
+                link!.Clear();
+                reused = null;
+                address = original;
+                continue;
+            }
             if ((int)response.StatusCode >= 300 && (int)response.StatusCode < 400 && response.Headers.Location != null) {
-                address = new Uri(new Uri(address), response.Headers.Location ?? throw new IOException("更新服务器返回了无效跳转")).AbsoluteUri;
+                var destination = new Uri(new Uri(address), response.Headers.Location);
+                if (link != null && address == original) signedRedirect = destination;
+                address = destination.AbsoluteUri;
                 continue;
             }
             response.EnsureSuccessStatusCode();
@@ -82,11 +104,22 @@ public static class PackProtocol {
             }
             using var input = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();
             byte[] buffer = new byte[128 * 1024]; long total = 0; int read;
-            while ((read = input.Read(buffer, 0, buffer.Length)) > 0) {
+            using var idle = failover ? new CancellationTokenSource() : null;
+            using var abort = idle?.Token.Register(input.Dispose);
+            int Read() {
+                idle?.CancelAfter(idleTimeout);
+                try { return input.Read(buffer, 0, buffer.Length); }
+                catch (Exception ex) when (idle?.IsCancellationRequested == true) {
+                    throw new IOException("下载线路长时间未返回数据。", ex);
+                } finally { idle?.CancelAfter(Timeout.InfiniteTimeSpan); }
+            }
+            while ((read = Read()) > 0) {
                 total += read; if (total > max) throw new InvalidDataException("下载内容超过清单声明的大小。");
                 output.Write(buffer, 0, read); progress?.Invoke(total);
             }
+            if (idle?.IsCancellationRequested == true) throw new IOException("下载线路长时间未返回数据。");
             if (offset.HasValue && total != max) throw new EndOfStreamException("ZIP 分段下载不完整。");
+            if (signedRedirect?.AbsoluteUri == address) link!.Remember(signedRedirect, DateTimeOffset.UtcNow);
             return;
         }
         throw new IOException("更新服务器跳转次数过多。");

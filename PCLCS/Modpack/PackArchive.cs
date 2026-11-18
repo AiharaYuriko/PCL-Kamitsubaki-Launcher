@@ -4,10 +4,11 @@ using System.IO.Compression;
 namespace PCL.Modpack;
 
 internal sealed class PackArchive(JObject archive, string cache, Action<string> progress, Func<long, bool>? approveWhole,
-    Action<string, Stream, long, long, long>? range = null) : IDisposable {
+    Action<string, Stream, long, long, long>? range = null, PackMirror? mirror = null) : IDisposable {
     private readonly string url = (string)archive["download_url"]!;
     private readonly long size = (long)archive["size"]!;
     private readonly string hash = (string)archive["sha256"]!;
+    private readonly PackArchiveLink mirrorLink = new();
     private bool? allowWhole;
     private bool verifiedWhole;
     private ZipArchive? whole;
@@ -16,7 +17,7 @@ internal sealed class PackArchive(JObject archive, string cache, Action<string> 
     public void Dispose() => whole?.Dispose();
 
     internal void Extract(JObject file, string destination, string scratch) {
-        if (file["entry"] is not JObject entry) throw new IOException("此文件没有 R2 备用内容。");
+        if (file["entry"] is not JObject entry) throw new IOException("此文件没有 ZIP 备用内容。");
         if (!verifiedWhole && System.IO.File.Exists(cache)) {
             verifiedWhole = Matches(cache, size, hash);
             if (!verifiedWhole) System.IO.File.Delete(cache);
@@ -26,34 +27,51 @@ internal sealed class PackArchive(JObject archive, string cache, Action<string> 
             return;
         }
         long length = (long)entry["length"]!;
-        try {
+        bool ReadEntry(string address, bool viaMirror) {
+            if (viaMirror) progress("正在从 S3 备用线路读取：" + (string)file["path"]!);
             using var compressed = new FileStream(scratch, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
-            if (length != 0) (range ?? PackProtocol.DownloadRange)(url, compressed, (long)entry["offset"]!, length, size);
+            if (length != 0) {
+                long offset = (long)entry["offset"]!;
+                if (range != null) range(address, compressed, offset, length, size);
+                else PackProtocol.DownloadRange(address, compressed, offset, length, size, mirror != null, viaMirror ? mirrorLink : null);
+            }
             compressed.Position = 0;
-            using var output = System.IO.File.Create(destination);
-            if ((string?)entry["method"] == "deflate" && length != 0) {
-                using var inflate = new DeflateStream(compressed, CompressionMode.Decompress, true);
-                CopyBounded(inflate, output, (long)file["size"]!);
-            } else CopyBounded(compressed, output, (long)file["size"]!);
+            long expected = (long)file["size"]!;
+            using (var output = System.IO.File.Create(destination)) {
+                if ((string?)entry["method"] == "deflate" && length != 0) {
+                    using var inflate = new DeflateStream(compressed, CompressionMode.Decompress, true);
+                    CopyBounded(inflate, output, expected);
+                } else CopyBounded(compressed, output, expected);
+            }
+            if (!Matches(destination, expected, (string)file["sha256"]!))
+                throw new InvalidDataException("ZIP 分段文件的 SHA-256 不匹配。");
+            return true;
+        }
+        try {
+            if (mirror == null) ReadEntry(url, false);
+            else mirror.Read(url, PackPublisher.ArchiveKey(hash), ReadEntry);
         } catch (Exception ex) when (ex is IOException or InvalidDataException or System.Net.Http.HttpRequestException or OperationCanceledException) {
             FetchWhole(file, destination, ex);
-            return;
         } finally {
             if (System.IO.File.Exists(scratch)) System.IO.File.Delete(scratch);
         }
-        if (!Matches(destination, (long)file["size"]!, (string)file["sha256"]!))
-            FetchWhole(file, destination, new InvalidDataException("ZIP 分段文件的 SHA-256 不匹配。"));
     }
 
     private void FetchWhole(JObject file, string destination, Exception failure) {
         allowWhole ??= approveWhole?.Invoke(size) ?? false;
         if (allowWhole != true) throw new IOException("无法使用 ZIP 分段下载：" + failure.Message, failure);
-        progress("正在下载完整整合包……");
         string temporary = cache + ".part";
-        try {
-            using (var output = System.IO.File.Create(temporary)) PackProtocol.Download(url, output, size,
-                received => progress($"正在下载完整整合包：{received / 1048576d:F1} / {size / 1048576d:F1} MB"));
+        bool DownloadWhole(string address, bool viaMirror) {
+            string label = viaMirror ? "正在从 S3 备用线路下载完整整合包" : "正在下载完整整合包";
+            progress(label + "……");
+            using (var output = System.IO.File.Create(temporary)) PackProtocol.Download(address, output, size,
+                received => progress($"{label}：{received / 1048576d:F1} / {size / 1048576d:F1} MB"), mirror != null, viaMirror ? mirrorLink : null);
             if (!Matches(temporary, size, hash)) throw new InvalidDataException("完整 ZIP 校验失败。");
+            return true;
+        }
+        try {
+            if (mirror == null) DownloadWhole(url, false);
+            else mirror.Read(url, PackPublisher.ArchiveKey(hash), DownloadWhole);
             System.IO.File.Move(temporary, cache);
             verifiedWhole = true;
         } finally {

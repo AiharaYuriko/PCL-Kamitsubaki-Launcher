@@ -9,6 +9,7 @@ Public Class PageInstancePackUpdate
     Private ReadOnly Updater As PackUpdater
     Private Release As JObject
     Private Preview As PackPlan
+    Private Mirror As PackMirror
     Private Busy As Boolean
     Private LoadingComponents As Boolean
     Private Started As Boolean
@@ -22,8 +23,12 @@ Public Class PageInstancePackUpdate
         InitializeComponent()
         Target = Instance
         Updater = New PackUpdater(Instance.PathVersion)
-        Dim SavedSource = CStr(Updater.Binding("source"))
+        Dim Binding = Updater.Binding
+        Dim SavedSource = CStr(Binding("source"))
         Source.Text = If(String.IsNullOrWhiteSpace(SavedSource), ModPackUpdate.DefaultPackSource, SavedSource)
+        MirrorSource.Text = If(CStr(Binding("mirror_url")), "")
+        PreferMirror.Checked = CBool(If(Binding("prefer_mirror"), New JValue(False)))
+        PreferMirror.IsEnabled = Not String.IsNullOrWhiteSpace(MirrorSource.Text)
         Status.Text = "可以直接读取默认更新源，也可以输入服主提供的地址。"
         Restore.IsEnabled = Updater.HasBackup OrElse Updater.NeedsRecovery
         If Updater.NeedsRecovery Then Status.Text = "上次更新未完成，请先点击'恢复上次更新'。恢复前暂时不能启动游戏。"
@@ -34,9 +39,12 @@ Public Class PageInstancePackUpdate
         AddHandler Choices.SelectionChanged, Sub()
                                                  Release = Nothing : Preview = Nothing : Components.Children.Clear() : Details.Children.Clear() : Update.IsEnabled = False
                                              End Sub
-        AddHandler Source.TextChanged, Sub()
-                                          Choices.Items.Clear() : Preview = Nothing : Update.IsEnabled = False
-                                      End Sub
+        AddHandler Source.TextChanged, Sub() InvalidateSource()
+        AddHandler MirrorSource.TextChanged, Sub()
+                                                PreferMirror.IsEnabled = Not String.IsNullOrWhiteSpace(MirrorSource.Text)
+                                                InvalidateSource()
+                                            End Sub
+        AddHandler PreferMirror.Change, Sub() InvalidateSource()
         AddHandler Loaded, Async Sub()
                                If Started Then Return
                                Started = True
@@ -44,9 +52,18 @@ Public Class PageInstancePackUpdate
                            End Sub
     End Sub
 
+    Private Sub InvalidateSource()
+        Choices.Items.Clear()
+        Mirror = Nothing
+        Preview = Nothing
+        Update.IsEnabled = False
+    End Sub
+
     Private Sub SetBusy(Value As Boolean)
         Busy = Value : Source.IsEnabled = Not Value : Choices.IsEnabled = Not Value : Components.IsEnabled = Not Value
         ReadSource.IsEnabled = Not Value : Check.IsEnabled = Not Value
+        MirrorSource.IsEnabled = Not Value
+        PreferMirror.IsEnabled = Not Value AndAlso Not String.IsNullOrWhiteSpace(MirrorSource.Text)
         Update.IsEnabled = Not Value AndAlso Preview IsNot Nothing AndAlso Not Preview.IsApplied
         Restore.IsEnabled = Not Value AndAlso (Updater.HasBackup OrElse Updater.NeedsRecovery)
         Bar.IsIndeterminate = Value
@@ -62,7 +79,9 @@ Public Class PageInstancePackUpdate
         SetBusy(True)
         Try
             Dim Address = Source.Text.Trim()
-            Dim Index = Await Task.Run(Function() PackUpdater.GetIndex(Updater.ResolveIndexAddress(Address)))
+            Dim MirrorAddress = MirrorSource.Text.Trim()
+            Mirror = If(MirrorAddress.Length = 0, Nothing, New PackMirror(MirrorAddress, PreferMirror.Checked))
+            Dim Index = Await Task.Run(Function() PackUpdater.GetIndex(Updater.ResolveIndexAddress(Address), Mirror))
             Choices.Items.Clear()
             For Each Pack As JObject In Index("packs")
                 For Each Channel As JObject In Pack("channels")
@@ -93,7 +112,7 @@ Public Class PageInstancePackUpdate
         SetBusy(True) : Preview = Nothing
         Try
             Dim Selection = CType(CType(Choices.SelectedItem, ComboBoxItem).Tag, JObject)
-            Release = Await Task.Run(Function() PackUpdater.GetRelease(CType(Selection("pack"), JObject), CType(Selection("channel"), JObject)))
+            Release = Await Task.Run(Function() PackUpdater.GetRelease(CType(Selection("pack"), JObject), CType(Selection("channel"), JObject), Mirror))
             LoadingComponents = True
             Dim Saved As JToken = If(SelectedOverride, If(Components.Children.Count = 0, Updater.State("selected"), New JArray(SelectedComponents())))
             Components.Children.Clear()
@@ -148,6 +167,7 @@ Public Class PageInstancePackUpdate
                      "确认接入旧实例", "更新此实例", "取消") <> 1 Then Return
         Dim Plan = Preview
         Dim Address = Source.Text.Trim()
+        Dim DownloadMirror = Mirror
         SetBusy(True)
         Dim Worker As New RedoableWorker(
         Sub()
@@ -156,9 +176,10 @@ Public Class PageInstancePackUpdate
                 If IsRestore Then
                     Updater.Rollback()
                 Else
-                    Updater.Bind(Address, CStr(Plan.Release("pack")("id")), CStr(Plan.Release("release")("channel")))
+                    Updater.Bind(Address, CStr(Plan.Release("pack")("id")), CStr(Plan.Release("release")("channel")), DownloadMirror)
                     Updater.Apply(Plan, Function() ModPackUpdate.PrepareRuntime(Target, Plan.Release),
                         Sub(Message) RunInUi(Sub() Status.Text = Message), options:=New PackDownloadOptions With {
+                            .Mirror = DownloadMirror,
                             .ApproveWholeArchive = Function(Size) RunInUiWait(Function() MyMsgBox(
                                 $"下载地址暂时无法读取 ZIP 分段。是否改为下载完整 ZIP（{Size / 1048576.0:F1} MB）？",
                                 "下载完整整合包", "下载", "取消") = 1),

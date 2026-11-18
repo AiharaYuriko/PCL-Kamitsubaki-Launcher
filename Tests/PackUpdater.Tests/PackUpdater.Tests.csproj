@@ -9,6 +9,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="System.IO.Compression" />
+    <Reference Include="System.Net.Http" />
     <ProjectReference Include="../../PCLCS/PCLCS.csproj" />
     <Reference Include="Newtonsoft.Json"><HintPath>../../Plain Craft Launcher 2/Resources/Newtonsoft.Json.dll</HintPath></Reference>
   </ItemGroup>

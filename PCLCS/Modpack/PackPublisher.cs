@@ -57,12 +57,12 @@ public sealed class PackPublisher(string root) {
         string suffix = "/" + ArchiveKey(hash);
         return archive.EndsWith(suffix, StringComparison.Ordinal) ? archive.Substring(0, archive.Length - suffix.Length) : null;
     }
-    public JObject ReadCredentials() {
-        var saved = (string?)Read("credentials.json")["encrypted"];
+    public JObject ReadCredentials(bool mirror = false) {
+        var saved = (string?)Read(mirror ? "mirror-credentials.json" : "credentials.json")["encrypted"];
         return saved == null ? new JObject() : PackProtocol.Parse(ProtectedData.Unprotect(Convert.FromBase64String(saved), null, DataProtectionScope.CurrentUser));
     }
-    public void SaveCredentials(string access, string secret) {
-        string path = ProjectFile("credentials.json");
+    public void SaveCredentials(string access, string secret, bool mirror = false) {
+        string path = ProjectFile(mirror ? "mirror-credentials.json" : "credentials.json");
         if (access.Length == 0 || secret.Length == 0) { File.Delete(path); return; }
         var bytes = PackR2Publisher.JsonBytes(new JObject { ["access"] = access, ["secret"] = secret });
         var encrypted = ProtectedData.Protect(bytes, null, DataProtectionScope.CurrentUser);
@@ -307,6 +307,7 @@ public sealed class PackPublisher(string root) {
         return entry;
     }
     internal static string ArchiveKey(string hash) => "pcl/archives/" + hash + ".zip";
+    internal static string ManifestKey(string pack, string channel, string release) => $"pcl/{pack}/{channel}/releases/{release}.json";
     internal static string PublicUrl(string root, string key) => root.TrimEnd('/') + "/" + key;
     internal void Remember(JObject manifest) => PackUpdater.Atomic(ProjectFile("latest.json"), manifest);
     public void Export(PackPublishDetails details, IReadOnlyList<PackPublishFile> files, string path) {

@@ -12,6 +12,8 @@
                         <local:MyTextBox x:Name="Source" HintText="https://下载域名/桶内目录" Margin="0,0,12,0" Height="35" VerticalContentAlignment="Center" />
                         <local:MyButton x:Name="ReadSource" Grid.Column="1" Text="读取更新源" Width="120" Height="35" />
                     </Grid>
+                    <local:MyTextBox x:Name="MirrorSource" HintText="S3 备用线路签名服务地址（可选）" Margin="0,0,0,8" Height="35" VerticalContentAlignment="Center" />
+                    <local:MyCheckBox x:Name="PreferMirror" Text="优先使用 S3 备用线路" Margin="0,0,0,12" />
                     <local:MyComboBox x:Name="Choices" Height="30" />
                 </StackPanel>
             </local:MyCard>

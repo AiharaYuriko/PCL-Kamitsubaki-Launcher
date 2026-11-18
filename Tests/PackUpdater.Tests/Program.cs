@@ -42,6 +42,26 @@ internal static partial class Program {
             onRange?.Invoke(length);
         };
     static void Main() {
+        TestArchiveLinks();
+        Test("dual publication preserves other channels and rejects a stale mirror release", _ => {
+            JObject Pointer(string channel, long sequence, string release) => new() {
+                ["id"] = channel, ["release_id"] = release, ["sequence"] = sequence,
+                ["manifest_url"] = $"https://primary.example/pcl/test/{channel}/releases/{release}.json",
+                ["manifest_sha256"] = PackProtocol.Hash(Encoding.UTF8.GetBytes(release))
+            };
+            var stable = Pointer("stable", 1, "a");
+            var test = Pointer("test", 1, "b");
+            var next = Pointer("stable", 2, "c");
+            byte[] first = PackR2Publisher.JsonBytes(PackR2Publisher.UpdateMirrorIndex(null, "Pack", "test", stable));
+            byte[] second = PackR2Publisher.JsonBytes(PackR2Publisher.UpdateMirrorIndex(first, "Pack", "test", test));
+            var updated = PackR2Publisher.UpdateMirrorIndex(second, "Pack", "test", next);
+            var channels = (JArray)updated["packs"]![0]!["channels"]!;
+            Assert(channels.Count == 2 && JToken.DeepEquals(channels[0], next) && JToken.DeepEquals(channels[1], test), "Other mirrored channel was lost");
+            byte[] final = PackR2Publisher.JsonBytes(updated);
+            Assert(final.SequenceEqual(PackR2Publisher.JsonBytes(PackR2Publisher.UpdateMirrorIndex(final, "Pack", "test", next))), "Same-release retry changed index bytes");
+            Throws(() => PackR2Publisher.UpdateMirrorIndex(final, "Pack", "test", stable));
+            Throws(() => PackR2Publisher.UpdateMirrorIndex(final, "Pack", "test", Pointer("stable", 2, "conflict")));
+        });
         TestLegacyUpgrades();
         Test("shared R2 source resolves to the same object key", root => {
             var updater = new PackUpdater(root);
@@ -172,6 +192,40 @@ internal static partial class Program {
             Assert(System.IO.File.ReadAllText(Path.Combine(player, "mods/new1.jar")) == "first" &&
                 System.IO.File.ReadAllText(Path.Combine(player, "mods/new2.jar")) == "second", "Archive data was not installed");
             Assert(System.IO.File.Exists(Path.Combine(player, "config/empty.toml")), "Empty ZIP member was not installed");
+        });
+        Test("S3 fallback retries corrupt ZIP ranges and stays on the working route", root => {
+            string author = Path.Combine(root, "author"), player = Path.Combine(root, "player"), zip = Path.Combine(root, "pack.zip");
+            Write(author, "config/one.toml", "old");
+            Write(player, "config/one.toml", "old");
+            var publisher = new PackPublisher(author);
+            publisher.SaveBaseline(publisher.Scan(PackPublisher.DefaultFolders));
+            Write(author, "config/one.toml", "new");
+            Write(author, "config/two.toml", "second");
+            var release = publisher.Build(Details(), publisher.Scan(PackPublisher.DefaultFolders), 1, zip, "https://primary.example");
+            var updater = new PackUpdater(player);
+            var mirror = new PackMirror("https://mirror.example/packs");
+            updater.Bind("https://primary.example", "test", "stable", mirror);
+            Assert((string?)updater.Binding["mirror_url"] == mirror.Address, "Mirror setting was not saved");
+            var requests = new List<string>();
+            var local = LocalRanges(zip);
+            updater.Apply(updater.Plan(release, Array.Empty<string>()), () => new PackRuntime(), _ => { },
+                options: new PackDownloadOptions {
+                    Mirror = mirror,
+                    ApproveWholeArchive = _ => throw new Exception("The mirror should supply the ranges"),
+                    DownloadRange = (address, output, offset, length, total) => {
+                        requests.Add(address);
+                        if (address.StartsWith("https://primary.example/", StringComparison.Ordinal)) {
+                            output.Write(new byte[(int)length], 0, (int)length);
+                            return;
+                        }
+                        local(address, output, offset, length, total);
+                    }
+                });
+            string key = "/pcl/archives/" + (string)release["archive"]!["sha256"]! + ".zip";
+            Assert(requests.SequenceEqual(new[] { "https://primary.example" + key, "https://mirror.example/packs" + key,
+                "https://mirror.example/packs" + key }), "Expected verification-driven failover to the same archive key");
+            Assert(System.IO.File.ReadAllText(Path.Combine(player, "config/one.toml")) == "new" &&
+                System.IO.File.ReadAllText(Path.Combine(player, "config/two.toml")) == "second", "Mirror data was not installed");
         });
         Test("legacy adoption and forced actions run once", root => {
             string author = Path.Combine(root, "author"), player = Path.Combine(root, "player"), zip = Path.Combine(root, "pack.zip");

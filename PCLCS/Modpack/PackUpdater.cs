@@ -53,22 +53,35 @@ public sealed partial class PackUpdater {
             ? (string?)binding["index_url"] ?? source
             : PackProtocol.IndexAddress(source);
     }
-    public void Bind(string source, string pack, string channel) {
+    public void Bind(string source, string pack, string channel, PackMirror? mirror = null) {
         PackProtocol.Https(source);
         if (State["pack_id"] != null && ((string?)State["pack_id"] != pack || (string?)State["channel"] != channel)) throw new InvalidOperationException("此实例已有其他整合包或频道的更新记录，请使用独立实例。");
-        Atomic(Work("binding.json"), new JObject { ["source"] = source, ["index_url"] = ResolveIndexAddress(source), ["pack_id"] = pack, ["channel"] = channel });
+        var binding = new JObject { ["source"] = source, ["index_url"] = ResolveIndexAddress(source), ["pack_id"] = pack, ["channel"] = channel };
+        if (mirror != null) {
+            binding["mirror_url"] = mirror.Address;
+            binding["prefer_mirror"] = mirror.PreferMirror;
+        }
+        Atomic(Work("binding.json"), binding);
     }
-    public static JObject GetIndex(string source) {
-        var value = PackProtocol.Parse(PackProtocol.Fetch(source));
-        PackProtocol.Validate(value, "index");
-        return value;
+    public static JObject GetIndex(string source, PackMirror? mirror = null) {
+        JObject Read(string address, bool _) {
+            var value = PackProtocol.Parse(PackProtocol.Fetch(address, 8 * 1024 * 1024, mirror != null));
+            PackProtocol.Validate(value, "index");
+            return value;
+        }
+        return mirror == null ? Read(source, false) : mirror.Read(source, PackProtocol.IndexPath, Read);
     }
-    public static JObject GetRelease(JObject pack, JObject channel) {
-        var bytes = PackProtocol.Fetch((string)channel["manifest_url"]!);
-        if (PackProtocol.Hash(bytes) != (string?)channel["manifest_sha256"]) throw new InvalidDataException("更新清单校验失败，请重新检查更新。");
-        var value = PackProtocol.Parse(bytes); PackProtocol.Validate(value, "release");
-        if ((string?)value["pack"]!["id"] != (string?)pack["id"] || (string?)value["release"]!["channel"] != (string?)channel["id"] || (string?)value["release"]!["id"] != (string?)channel["release_id"] || (long)value["release"]!["sequence"]! != (long)channel["sequence"]!) throw new InvalidDataException("服务器目录和版本清单不一致。");
-        return value;
+    public static JObject GetRelease(JObject pack, JObject channel, PackMirror? mirror = null) {
+        JObject Read(string address, bool _) {
+            var bytes = PackProtocol.Fetch(address, 8 * 1024 * 1024, mirror != null);
+            if (PackProtocol.Hash(bytes) != (string?)channel["manifest_sha256"]) throw new InvalidDataException("更新清单校验失败，请重新检查更新。");
+            var value = PackProtocol.Parse(bytes); PackProtocol.Validate(value, "release");
+            if ((string?)value["pack"]!["id"] != (string?)pack["id"] || (string?)value["release"]!["channel"] != (string?)channel["id"] || (string?)value["release"]!["id"] != (string?)channel["release_id"] || (long)value["release"]!["sequence"]! != (long)channel["sequence"]!) throw new InvalidDataException("服务器目录和版本清单不一致。");
+            return value;
+        }
+        string primary = (string)channel["manifest_url"]!;
+        string key = PackPublisher.ManifestKey((string)pack["id"]!, (string)channel["id"]!, (string)channel["release_id"]!);
+        return mirror == null ? Read(primary, false) : mirror.Read(primary, key, Read);
     }
     private string? Hash(string relative, bool internalFile = false) { string path = PackProtocol.Safe(root, relative, internalFile); if (Directory.Exists(path)) throw new IOException("目标路径被文件夹占用：" + relative); return File.Exists(path) ? PackProtocol.HashFile(path) : null; }
     private static bool Included(JToken item, HashSet<string> selected) => item["component"] == null || item["component"]!.Type == JTokenType.Null || selected.Contains((string)item["component"]!);
@@ -137,7 +150,7 @@ public sealed partial class PackUpdater {
             var skipped = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             int index = 0;
             using (var archive = archived ? new PackArchive((JObject)plan.Release["archive"]!, Work("downloads/" + (string)plan.Release["archive"]!["sha256"]! + ".zip"),
-                progress, options?.ApproveWholeArchive, options?.DownloadRange) : null)
+                progress, options?.ApproveWholeArchive, options?.DownloadRange, options?.Mirror) : null)
             foreach (var change in plan.Changes.Where(c => c.File != null)) {
                 if (archived) {
                     if (!StageArchiveFile(change, archive!, staged, progress, download, options)) skipped.Add(change.Path);

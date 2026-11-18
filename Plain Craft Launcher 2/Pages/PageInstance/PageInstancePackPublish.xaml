@@ -43,6 +43,11 @@
                         <TextBlock Text="S3 Secret Access Key" VerticalAlignment="Center" />
                         <PasswordBox x:Name="PublishSecret" Margin="0,0,0,6" Height="32" VerticalContentAlignment="Center" />
                     </UniformGrid>
+                    <local:MyCheckBox x:Name="PublishMirror" Text="发布后同步到旧私有 S3 桶" Margin="0,4,0,6" />
+                    <UniformGrid x:Name="PublishMirrorCredentials" Columns="2">
+                        <local:MyTextBox x:Name="PublishMirrorAccess" HintText="备用 S3 Access Key ID" Margin="0,0,6,6" Height="32" />
+                        <PasswordBox x:Name="PublishMirrorSecret" AutomationProperties.Name="备用 S3 Secret Access Key" Margin="0,0,0,6" Height="32" VerticalContentAlignment="Center" />
+                    </UniformGrid>
                     <WrapPanel Margin="0,2,0,8">
                         <local:MyCheckBox x:Name="PublishRemember" Text="为当前 Windows 用户保存凭据" Margin="0,0,14,6" />
                         <local:MyCheckBox x:Name="PublishDowngrade" Text="允许 NeoForge 降级" Margin="0,0,0,6" />

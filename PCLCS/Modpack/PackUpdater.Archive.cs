@@ -8,6 +8,7 @@ public sealed class PackDownloadOptions {
     public Func<string, string, string?>? SelectLocalFile { get; set; }
     public Func<string, bool>? SkipOptional { get; set; }
     public Action<string, Stream, long, long, long>? DownloadRange { get; set; }
+    public PackMirror? Mirror { get; set; }
 }
 
 public sealed partial class PackUpdater {
@@ -256,7 +257,7 @@ public sealed partial class PackUpdater {
                 if (ready) break;
             }
             if (!ready && file["entry"] != null) {
-                progress("正在从 R2 读取：" + change.Name);
+                progress("正在读取整合包 ZIP：" + change.Name);
                 ready = Attempt(() => archive.Extract(file, temporary, Work("stage/compressed.part")));
             }
             if (!ready && options?.SelectLocalFile?.Invoke(change.Path, failure?.Message ?? "") is string source && source.Length > 0) {
