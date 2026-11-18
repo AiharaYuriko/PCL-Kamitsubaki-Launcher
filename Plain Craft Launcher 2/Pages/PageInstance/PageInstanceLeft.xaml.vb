@@ -6,9 +6,15 @@ Public Class PageInstanceLeft
     ''' </summary>
     Public Shared Instance As McInstance = Nothing
     Private PackPage As PageInstancePackUpdate
+    Private PublishPage As PageInstancePackPublish
 
     Private Sub PageInstanceLeft_Loaded(sender As Object, e As RoutedEventArgs) Handles Me.Loaded
         PageSetupUI.HiddenRefresh()
+        RefreshPackPublishEntry()
+    End Sub
+
+    Public Sub RefreshPackPublishEntry()
+        ItemPackPublish.Visibility = If(Settings.Get(Of Boolean)("ToolPackPublish"), Visibility.Visible, Visibility.Collapsed)
     End Sub
 
     Public Sub RefreshModDisabled() Handles Me.Loaded
@@ -31,7 +37,7 @@ Public Class PageInstanceLeft
     ''' <summary>
     ''' 勾选事件改变页面。
     ''' </summary>
-    Private Sub PageCheck(sender As FrameworkElement, e As RouteEventArgs) Handles ItemOverall.Check, ItemMod.Check, ItemModDisabled.Check, ItemSetup.Check, ItemModify.Check, ItemExport.Check, ItemPackUpdate.Check
+    Private Sub PageCheck(sender As FrameworkElement, e As RouteEventArgs) Handles ItemOverall.Check, ItemMod.Check, ItemModDisabled.Check, ItemSetup.Check, ItemModify.Check, ItemExport.Check, ItemPackUpdate.Check, ItemPackPublish.Check
         '尚未初始化控件属性时，sender.Tag 为 Nothing，会导致切换到页面 0
         '若使用 IsLoaded，则会导致模拟点击不被执行（模拟点击切换页面时，控件的 IsLoaded 为 False）
         If sender.Tag IsNot Nothing Then PageChange(Val(sender.Tag))
@@ -39,10 +45,22 @@ Public Class PageInstanceLeft
 
     Public Function PageGet(Optional ID As FormMain.PageSubType = -1)
         If ID = -1 Then ID = PageID
+        If ID = FormMain.PageSubType.InstancePackPublish AndAlso Not Settings.Get(Of Boolean)("ToolPackPublish") Then
+            ID = FormMain.PageSubType.InstanceOverall
+            If PageID = FormMain.PageSubType.InstancePackPublish Then
+                PageID = ID
+                ItemOverall.Checked = True
+            End If
+        End If
         Select Case ID
             Case FormMain.PageSubType.InstancePackUpdate
                 If PackPage Is Nothing OrElse Not PathUtils.IsSame(PackPage.InstancePath, Instance.PathVersion) Then PackPage = New PageInstancePackUpdate(Instance)
                 Return PackPage
+            Case FormMain.PageSubType.InstancePackPublish
+                If PublishPage Is Nothing OrElse Not PathUtils.IsSame(PublishPage.InstancePath, Instance.PathVersion) Then
+                    PublishPage = New PageInstancePackPublish(Instance)
+                End If
+                Return PublishPage
             Case FormMain.PageSubType.InstanceOverall
                 If FrmInstanceOverall Is Nothing Then FrmInstanceOverall = New PageInstanceOverall
                 Return FrmInstanceOverall
@@ -71,6 +89,7 @@ Public Class PageInstanceLeft
     ''' </summary>
     Public Sub PageChange(ID As FormMain.PageSubType)
         If PageID = ID Then Return
+        If ID = FormMain.PageSubType.InstancePackPublish AndAlso Not Settings.Get(Of Boolean)("ToolPackPublish") Then Return
         If Instance IsNot Nothing AndAlso McInstanceLock.IsLocked(Instance) Then
             Hint("该版本正在被修改，请稍后再切换页面！", HintType.Red)
             Return

@@ -27,7 +27,7 @@ Public Class PageInstancePackUpdate
         Restore.IsEnabled = Updater.HasBackup OrElse Updater.NeedsRecovery
         If Updater.NeedsRecovery Then Status.Text = "上次更新未完成，请先点击'恢复上次更新'。恢复前暂时不能启动游戏。"
         AddHandler ReadSource.Click, Async Sub() Await LoadSource()
-        AddHandler Check.Click, Async Sub() Await CheckUpdate()
+        AddHandler Check.Click, Async Sub() Await LoadSource()
         AddHandler Update.Click, Sub() StartUpdate(False)
         AddHandler Restore.Click, Sub() StartUpdate(True)
         AddHandler Choices.SelectionChanged, Sub()
@@ -46,12 +46,18 @@ Public Class PageInstancePackUpdate
     Private Sub SetBusy(Value As Boolean)
         Busy = Value : Source.IsEnabled = Not Value : Choices.IsEnabled = Not Value : Components.IsEnabled = Not Value
         ReadSource.IsEnabled = Not Value : Check.IsEnabled = Not Value
-        Update.IsEnabled = Not Value AndAlso Preview IsNot Nothing
+        Update.IsEnabled = Not Value AndAlso Preview IsNot Nothing AndAlso Not Preview.IsApplied
         Restore.IsEnabled = Not Value AndAlso (Updater.HasBackup OrElse Updater.NeedsRecovery)
         Bar.IsIndeterminate = Value
     End Sub
     Private Async Function LoadSource() As Task
         If Busy Then Return
+        Dim CurrentChoice = TryCast(Choices.SelectedItem, ComboBoxItem)
+        Dim CurrentBinding = If(CurrentChoice Is Nothing, Nothing, TryCast(CurrentChoice.Tag, JObject))
+        Dim Selected = If(CurrentBinding Is Nothing OrElse Components.Children.Count = 0, Nothing, New JArray(SelectedComponents()))
+        Dim PackId = If(CurrentBinding Is Nothing, CStr(Updater.Binding("pack_id")), CStr(CurrentBinding("pack")("id")))
+        Dim ChannelId = If(CurrentBinding Is Nothing, CStr(Updater.Binding("channel")), CStr(CurrentBinding("channel")("id")))
+        Preview = Nothing
         SetBusy(True)
         Try
             Dim Address = Source.Text.Trim()
@@ -61,29 +67,34 @@ Public Class PageInstancePackUpdate
                 For Each Channel As JObject In Pack("channels")
                     Dim Item As New MyComboBoxItem With {.Content = CStr(Pack("name")) & " · " & CStr(Channel("id")), .Tag = New JObject From {{"pack", Pack.DeepClone()}, {"channel", Channel.DeepClone()}}}
                     Choices.Items.Add(Item)
-                    If CStr(Updater.Binding("pack_id")) = CStr(Pack("id")) AndAlso CStr(Updater.Binding("channel")) = CStr(Channel("id")) Then Choices.SelectedItem = Item
+                    If PackId = CStr(Pack("id")) AndAlso ChannelId = CStr(Channel("id")) Then Choices.SelectedItem = Item
                 Next
             Next
             If Choices.SelectedIndex < 0 AndAlso Choices.Items.Count > 0 Then Choices.SelectedIndex = 0
             Status.Text = "请选择整合包，点击'检查更新'查看本次变化。"
         Catch ex As Exception
             Status.Text = "读取失败：" & ex.Message & vbCrLf & "请检查地址后重试。"
+            Return
         Finally
             SetBusy(False)
         End Try
-        If Choices.SelectedItem IsNot Nothing Then Await CheckUpdate()
+        If Choices.SelectedItem IsNot Nothing Then
+            Dim Selection = CType(CType(Choices.SelectedItem, ComboBoxItem).Tag, JObject)
+            If PackId <> CStr(Selection("pack")("id")) OrElse ChannelId <> CStr(Selection("channel")("id")) Then Selected = Nothing
+            Await CheckUpdate(Selected)
+        End If
     End Function
     Private Function SelectedComponents() As List(Of String)
         Return Components.Children.OfType(Of MyCheckBox)().Where(Function(c) c.Checked).Select(Function(c) CStr(c.Tag)).ToList()
     End Function
-    Private Async Function CheckUpdate() As Task
+    Private Async Function CheckUpdate(Optional SelectedOverride As JArray = Nothing) As Task
         If Busy OrElse Choices.SelectedItem Is Nothing Then Return
         SetBusy(True) : Preview = Nothing
         Try
             Dim Selection = CType(CType(Choices.SelectedItem, ComboBoxItem).Tag, JObject)
             Release = Await Task.Run(Function() PackUpdater.GetRelease(CType(Selection("pack"), JObject), CType(Selection("channel"), JObject)))
             LoadingComponents = True
-            Dim Saved As JToken = If(Components.Children.Count = 0, Updater.State("selected"), New JArray(SelectedComponents()))
+            Dim Saved As JToken = If(SelectedOverride, If(Components.Children.Count = 0, Updater.State("selected"), New JArray(SelectedComponents())))
             Components.Children.Clear()
                 For Each Component As JObject In Release("components")
                     Dim Id = CStr(Component("id"))
@@ -97,20 +108,31 @@ Public Class PageInstancePackUpdate
                 Next
             LoadingComponents = False
             Dim Selected = SelectedComponents()
-            Dim RuntimeMessage = Await Task.Run(Function() ModPackUpdate.CheckRuntime(Target, Release))
             Preview = Await Task.Run(Function() Updater.Plan(Release, Selected))
+            Dim RuntimeMessage = If(Preview.IsApplied, "此版本已应用。", Await Task.Run(Function() ModPackUpdate.CheckRuntime(Target, Release)))
             Details.Children.Clear()
             For Each Change In Preview.Changes
                 Dim Item As New MyListItem With {.Title = Change.Kind & " · " & Change.Name, .Info = Change.Path & If(Change.Reason = "", "", " · " & Change.Reason), .Height = 62,
                     .Logo = If(Change.Icon = "", "pack://application:,,,/images/Blocks/NeoForge.png", Change.Icon)}
                 Details.Children.Add(Item)
             Next
+            For Each Path In Preview.Preserved
+                Details.Children.Add(New MyListItem With {.Title = "保留本地", .Info = Path, .Height = 52})
+            Next
             Dim Installed = If(CStr(Updater.State("release_id")), "未绑定")
+            Dim Archived = CStr(Release("schema")) = PackProtocol.ArchiveRelease
             Status.Text = Installed & " → " & CStr(Release("release")("id")) & vbCrLf & RuntimeMessage & vbCrLf &
-                $"{Preview.Changes.Count} 项文件变化，下载 {Preview.Bytes / 1024 / 1024:F1} MB。" & vbCrLf & CStr(Release("release")("notes"))
-            If Updater.State("release_id") Is Nothing Then Status.Text &= vbCrLf & "首次绑定：保留未识别的额外文件。"
-            Status.Text &= vbCrLf & "点击更新将应用以上变化；受管文件会替换，额外文件保留。"
-            Update.Text = If(Preview.Changes.Count = 0, "更新 / 检查修复", "更新整合包")
+                $"{Preview.Changes.Count} 项文件变化，{If(Archived, "待获取文件总大小", "下载")} {Preview.Bytes / 1024 / 1024:F1} MB。" & vbCrLf & CStr(Release("release")("notes"))
+            If Preview.BaselineMatches.HasValue Then
+                Dim ExpectedName = If(CStr(Release("baseline_instance")), "旧整合包")
+                Status.Text &= vbCrLf & $"首次接入 · 基线实例 {ExpectedName} · 已匹配 {Preview.BaselineMatches.Value}/{CType(Release("baseline"), JArray).Count} 项文件。"
+            ElseIf Updater.State("release_id") Is Nothing Then
+                Status.Text &= vbCrLf & "首次绑定：保留未识别的额外文件。"
+            End If
+            If Not Preview.IsApplied Then Status.Text &= vbCrLf & If(Archived,
+                "点击更新将应用本次发布操作。列表中的本地内容会保留。",
+                "点击更新将应用以上变化；受管文件会替换，额外文件保留。")
+            Update.Text = If(Preview.IsApplied, "已应用此版本", If(Preview.Changes.Count = 0 AndAlso Not Archived, "更新 / 检查修复", "更新整合包"))
         Catch ex As Exception
             Preview = Nothing : Status.Text = ex.Message
         Finally
@@ -118,8 +140,11 @@ Public Class PageInstancePackUpdate
         End Try
     End Function
     Private Sub StartUpdate(IsRestore As Boolean)
-        If Busy OrElse (Not IsRestore AndAlso Preview Is Nothing) Then Return
+        If Busy OrElse (Not IsRestore AndAlso (Preview Is Nothing OrElse Preview.IsApplied)) Then Return
         If IsRestore AndAlso MyMsgBox("恢复最近一次更新前的环境和文件？", "恢复更新", "继续", "取消") <> 1 Then Return
+        If Not IsRestore AndAlso Preview.BaselineMatches.HasValue AndAlso Preview.BaselineMatches.Value = 0 AndAlso
+            MyMsgBox("当前实例没有匹配旧整合包基线的文件。请核对实例名称和上方的变更预览，再决定是否在此实例更新。",
+                     "确认接入旧实例", "更新此实例", "取消") <> 1 Then Return
         Dim Plan = Preview
         Dim Address = Source.Text.Trim()
         SetBusy(True)
@@ -132,7 +157,19 @@ Public Class PageInstancePackUpdate
                 Else
                     Updater.Bind(Address, CStr(Plan.Release("pack")("id")), CStr(Plan.Release("release")("channel")))
                     Updater.Apply(Plan, Function() ModPackUpdate.PrepareRuntime(Target, Plan.Release),
-                        Sub(Message) RunInUi(Sub() Status.Text = Message))
+                        Sub(Message) RunInUi(Sub() Status.Text = Message), options:=New PackDownloadOptions With {
+                            .ApproveWholeArchive = Function(Size) RunInUiWait(Function() MyMsgBox(
+                                $"下载地址暂时无法读取 ZIP 分段。是否改为下载完整 ZIP（{Size / 1048576.0:F1} MB）？",
+                                "下载完整整合包", "下载", "取消") = 1),
+                            .SelectLocalFile = Function(Path, Failure) RunInUiWait(
+                                Function()
+                                    If MyMsgBox("下载失败：" & Path & vbCrLf & Failure & vbCrLf & "可选择本地的同版本文件继续。",
+                                                "获取整合包文件", "选择文件", "取消") <> 1 Then Return Nothing
+                                    Return Dialogs.SelectFile("选择 " & Path, False).FirstOrDefault()
+                                End Function),
+                            .SkipOptional = Function(Path) RunInUiWait(Function() MyMsgBox("跳过未取得的可选文件？" & vbCrLf & Path,
+                                "可选文件下载失败", "跳过", "停止更新") = 1)
+                        })
                 End If
                 RunInUi(Sub() Status.Text = If(IsRestore, "已恢复，可以重新检查更新。", "更新完成，可以返回启动页启动游戏。仅保留最近一次回退备份。"))
             Catch ex As Exception

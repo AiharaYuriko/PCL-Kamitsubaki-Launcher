@@ -41,5 +41,7 @@
                 </x:Array>
             </local:MyListItem.Buttons>
         </local:MyListItem>
+        <local:MyListItem x:Name="ItemPackPublish" IsScaleAnimationEnabled="False" Type="RadioBox" Tag="7" MinPaddingRight="35" Height="36"
+                          Title="整合包发布" Visibility="Collapsed" Logo="M5 20h14v-2H5zm7-16-6 6h4v6h4v-6h4z" />
     </StackPanel>
 </local:MyPageLeft>

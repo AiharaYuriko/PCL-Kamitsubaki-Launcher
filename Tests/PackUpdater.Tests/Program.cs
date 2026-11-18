@@ -2,13 +2,14 @@ using Newtonsoft.Json.Linq;
 using PCL.Modpack;
 using System.Text;
 
-internal static class Program {
+internal static partial class Program {
     static int passed;
     static void Assert(bool condition, string message) { if (!condition) throw new Exception(message); }
     static void Test(string name, Action<string> action) {
         string root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "fixtures", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         try { action(root); passed++; Console.WriteLine("PASS " + name); }
+        catch (Exception ex) { Console.Error.WriteLine("FAIL " + name + ": " + ex.Message); Environment.ExitCode = 1; }
         finally { Directory.Delete(root, true); }
     }
     static void Write(string root, string path, string content) { string target = Path.Combine(root, path); Directory.CreateDirectory(Path.GetDirectoryName(target)!); File.WriteAllText(target, content, new UTF8Encoding(false)); }
@@ -27,7 +28,21 @@ internal static class Program {
     static void Download(string url, string target, long size) => System.IO.File.WriteAllText(target, Uri.UnescapeDataString(new Uri(url).AbsolutePath.Substring(1)), new UTF8Encoding(false));
     static void Apply(PackUpdater updater, JObject release, Func<PackRuntime>? runtime = null, string[]? selected = null) => updater.Apply(updater.Plan(release, selected ?? new string[0]), runtime ?? (() => new PackRuntime()), _ => { }, Download);
     static void Throws(Action action) { bool failed = false; try { action(); } catch { failed = true; } Assert(failed, "Expected failure"); }
+    static PackPublishDetails Details(string id = "archive1") => new() {
+        PackId = "test", Name = "Archive Test", ReleaseId = id, Minecraft = "1.21.1", NeoForge = "21.1.219"
+    };
+    static Action<string, Stream, long, long, long> LocalRanges(string zip, Action<long>? onRange = null) =>
+        (_, output, offset, length, total) => {
+            using var input = System.IO.File.OpenRead(zip);
+            Assert(total == input.Length && offset + length <= total, "Invalid byte range");
+            input.Position = offset;
+            byte[] data = new byte[checked((int)length)];
+            Assert(input.Read(data, 0, data.Length) == data.Length, "Short test archive");
+            output.Write(data, 0, data.Length);
+            onRange?.Invoke(length);
+        };
     static void Main() {
+        TestLegacyUpgrades();
         Test("update, preserve, cleanup and one backup", root => {
             var updater = new PackUpdater(root); Write(root, "options.txt", "player"); Write(root, "mods/personal.jar", "extra");
             Apply(updater, Release(1, FileEntry("config/a.toml", "one"), FileEntry("mods/old.jar", "old"), FileEntry("options.txt", "defaults", "preserve")));
@@ -99,6 +114,208 @@ internal static class Program {
         Test("changed preview cannot execute", root => {
             var updater = new PackUpdater(root); var plan = updater.Plan(Release(1, FileEntry("config/a", "a")), new string[0]);
             Write(root, "config/a", "changed"); Throws(() => updater.Apply(plan, () => new PackRuntime(), _ => { }, Download));
+        });
+        Test("complete published ZIP supplies only required fallback ranges", root => {
+            string author = Path.Combine(root, "author"), player = Path.Combine(root, "player"), zip = Path.Combine(root, "pack.zip");
+            Write(author, "mods/reused.jar", "same");
+            Write(player, "mods/reused.jar", "same");
+            var publisher = new PackPublisher(author);
+            publisher.SaveBaseline(publisher.Scan(PackPublisher.DefaultFolders));
+            Write(author, "mods/new1.jar", "first");
+            Write(author, "mods/new2.jar", "second");
+            Write(author, "config/empty.toml", "");
+            var files = publisher.Scan(PackPublisher.DefaultFolders);
+            foreach (var file in files.Where(f => f.Category == "mod")) {
+                file.EmbedMod = true;
+                file.Urls.Add("https://example.com/platform");
+            }
+            var release = publisher.Build(Details(), files, 1, zip, "https://example.com");
+            var updater = new PackUpdater(player);
+            var preview = updater.Plan(release, Array.Empty<string>());
+            Assert(preview.BaselineMatches == 1 && preview.Changes.Count == 3, "Reused file should not be downloaded");
+            int platform = 0, ranges = 0; long bytes = 0;
+            updater.Apply(preview, () => new PackRuntime(), _ => { },
+                (_, _, _) => { platform++; throw new IOException("platform offline"); },
+                new PackDownloadOptions { DownloadRange = LocalRanges(zip, size => { ranges++; bytes += size; }) });
+            Assert(platform == 4 && ranges == 2 && bytes < new FileInfo(zip).Length, "Fallback downloaded more than the two ZIP slices");
+            Assert(System.IO.File.ReadAllText(Path.Combine(player, "mods/new1.jar")) == "first" &&
+                System.IO.File.ReadAllText(Path.Combine(player, "mods/new2.jar")) == "second", "Archive data was not installed");
+            Assert(System.IO.File.Exists(Path.Combine(player, "config/empty.toml")), "Empty ZIP member was not installed");
+        });
+        Test("legacy adoption and forced actions run once", root => {
+            string author = Path.Combine(root, "author"), player = Path.Combine(root, "player"), zip = Path.Combine(root, "pack.zip");
+            Write(author, "mods/toggle.jar.disabled", "toggle");
+            Write(author, "mods/removed.jar", "before");
+            Write(author, "config/private.toml", "initial");
+            Write(author, "config/settings.json", """{"server":{"rule":1},"local":0}""");
+            foreach (string path in new[] { "mods/toggle.jar.disabled", "mods/removed.jar", "config/private.toml", "config/settings.json" })
+                Write(player, path, System.IO.File.ReadAllText(Path.Combine(author, path)));
+            var publisher = new PackPublisher(author);
+            publisher.SaveBaseline(publisher.Scan(PackPublisher.DefaultFolders));
+            System.IO.File.Move(Path.Combine(player, "mods/toggle.jar.disabled"), Path.Combine(player, "mods/toggle.jar"));
+            Write(player, "mods/removed.jar", "player edit");
+            Write(player, "config/private.toml", "my view distance");
+            Write(player, "config/settings.json", """{"server":{"rule":1},"local":30}""");
+            Write(author, "config/private.toml", "new default");
+            Write(author, "config/settings.json", """{"server":{"rule":2},"local":99}""");
+            var files = publisher.Scan(PackPublisher.DefaultFolders);
+            files.Single(f => f.Path == "mods/removed.jar").Operation = PackPublisher.Delete;
+            files.Single(f => f.Path == "mods/toggle.jar.disabled").EmbedMod = true;
+            var settings = files.Single(f => f.Path == "config/settings.json");
+            settings.Operation = PackPublisher.Patch;
+            settings.JsonKeys = "/server/rule";
+            var updater = new PackUpdater(player);
+            var release = publisher.Build(Details(), files, 1, zip, "https://example.com");
+            var range = new PackDownloadOptions { DownloadRange = LocalRanges(zip) };
+            updater.Apply(updater.Plan(release, Array.Empty<string>()), () => new PackRuntime(), _ => { }, options: range);
+            Assert(System.IO.File.Exists(Path.Combine(player, "mods/toggle.jar")), "Player enabled state was overwritten");
+            Assert(!System.IO.File.Exists(Path.Combine(player, "mods/removed.jar")), "Explicit delete was not applied");
+            Assert(System.IO.File.ReadAllText(Path.Combine(player, "config/private.toml")) == "my view distance", "Player config was overwritten");
+            var merged = JObject.Parse(System.IO.File.ReadAllText(Path.Combine(player, "config/settings.json")));
+            Assert((int)merged["server"]!["rule"]! == 2 && (int)merged["local"]! == 30, "JSON operation changed an unrelated key");
+            Write(player, "mods/removed.jar", "player reinstalled");
+            Assert(updater.Plan(release, Array.Empty<string>()).IsApplied, "Rechecking reapplied a forced action");
+            updater.Apply(updater.Plan(release, Array.Empty<string>()), () => throw new Exception("Runtime shouldn't run"), _ => { }, options: range);
+            Assert(System.IO.File.Exists(Path.Combine(player, "mods/removed.jar")), "Same-version check undid player modification");
+            Write(author, "config/settings.json", """{"server":{"rule":3},"local":100}""");
+            files = publisher.Scan(PackPublisher.DefaultFolders);
+            files.Single(f => f.Path == "mods/toggle.jar.disabled").EmbedMod = true;
+            files.Single(f => f.Path == "mods/removed.jar").Operation = PackPublisher.Exclude;
+            var wholeFile = publisher.Build(Details("whole"), files, 2, zip, "https://example.com");
+            var currentState = updater.State;
+            var legacyState = (JObject)currentState.DeepClone();
+            var patchedRecord = legacyState["files"]!.Cast<JObject>().Single(f => (string?)f["path"] == settings.Path);
+            Assert((string?)patchedRecord["json_patch"]?["keys"]?[0] == "/server/rule", "Patch ownership missing");
+            patchedRecord.Remove("json_patch");
+            PackUpdater.Atomic(Path.Combine(player, ".pcl-update/state.json"), legacyState);
+            Assert(!updater.Plan(wholeFile, Array.Empty<string>()).Changes.Any(c => c.Path == settings.Path), "Legacy merged config overwritten");
+            PackUpdater.Atomic(Path.Combine(player, ".pcl-update/state.json"), currentState);
+            updater.Apply(updater.Plan(wholeFile, Array.Empty<string>()), () => new PackRuntime(), _ => { }, options: range);
+            string settingsPath = Path.Combine(player, "config/settings.json");
+            Assert(JToken.DeepEquals(JObject.Parse(System.IO.File.ReadAllText(settingsPath)), merged), "Whole-file update overwrote patched player config");
+            files.Single(f => f.Path == "config/settings.json").Operation = PackPublisher.Exclude;
+            var removed = publisher.Build(Details("removed"), files, 3, zip, "https://example.com");
+            updater.Apply(updater.Plan(removed, Array.Empty<string>()), () => new PackRuntime(), _ => { }, options: range);
+            Assert(JToken.DeepEquals(JObject.Parse(System.IO.File.ReadAllText(settingsPath)), merged), "Cleanup deleted patched player config");
+        });
+        Test("preinstalled renamed mod removes only verified old copy", root => {
+            string author = Path.Combine(root, "author"), player = Path.Combine(root, "player");
+            Write(author, "mods/a-1.jar", "old");
+            var publisher = new PackPublisher(author);
+            var baseline = publisher.Scan(PackPublisher.DefaultFolders);
+            baseline.Single().ModId = "example";
+            publisher.SaveBaseline(baseline);
+            System.IO.File.Delete(Path.Combine(author, "mods/a-1.jar"));
+            Write(author, "mods/a-2.jar", "new");
+            var files = publisher.Scan(PackPublisher.DefaultFolders);
+            var newer = files.Single(f => f.Path == "mods/a-2.jar");
+            newer.ModId = "example";
+            newer.EmbedMod = true;
+            var release = publisher.Build(Details(), files, 1, Path.Combine(root, "pack.zip"), "https://example.com");
+            var updater = new PackUpdater(player);
+            Write(player, "mods/a-2.jar", "new");
+            Write(player, "mods/a-1.jar", "player");
+            Throws(() => updater.Plan(release, Array.Empty<string>()));
+            Write(player, "mods/a-1.jar", "old");
+            var plan = updater.Plan(release, Array.Empty<string>());
+            Assert(plan.Changes.Single().Path == "mods/a-1.jar" && plan.Bytes == 0, "Incorrect duplicate cleanup preview");
+            updater.Apply(plan, () => new PackRuntime(), _ => { });
+            Assert(!System.IO.File.Exists(Path.Combine(player, "mods/a-1.jar")) && System.IO.File.ReadAllText(Path.Combine(player, "mods/a-2.jar")) == "new", "Duplicate mod survived");
+        });
+        Test("skipped optional upgrade remains managed until next release", root => {
+            string author = Path.Combine(root, "author"), player = Path.Combine(root, "player"), zip = Path.Combine(root, "pack.zip");
+            Write(author, "mods/optional.jar", "old");
+            Write(player, "mods/optional.jar", "old");
+            var publisher = new PackPublisher(author);
+            publisher.SaveBaseline(publisher.Scan(PackPublisher.DefaultFolders));
+            Write(author, "mods/optional.jar", "updated");
+            var files = publisher.Scan(PackPublisher.DefaultFolders);
+            var optional = files.Single();
+            optional.Optional = true;
+            optional.Urls.Add("https://example.com/updated");
+            var release = publisher.Build(Details(), files, 1, zip, "https://example.com");
+            var updater = new PackUpdater(player);
+            updater.Apply(updater.Plan(release, Array.Empty<string>()), () => new PackRuntime(), _ => { },
+                (_, _, _) => throw new IOException("offline"), new PackDownloadOptions { SkipOptional = _ => true });
+            Assert(System.IO.File.ReadAllText(Path.Combine(player, optional.Path)) == "old", "Skip changed installed file");
+            Apply(updater, publisher.Build(Details("retry"), files, 2, zip, "https://example.com"));
+            Assert(System.IO.File.ReadAllText(Path.Combine(player, optional.Path)) == "updated", "Later release did not upgrade skipped mod");
+        });
+        Test("rollback after interrupted backup preparation", root => {
+            var updater = new PackUpdater(root);
+            Apply(updater, Release(1, FileEntry("config/a", "one")));
+            Apply(updater, Release(2, FileEntry("config/a", "two")));
+            Write(root, ".pcl-update/stage/backup/files/0", "incomplete");
+            Write(root, ".pcl-update/pending/files/0", "legacy incomplete");
+            updater.Rollback();
+            Assert(!updater.NeedsRecovery && System.IO.File.ReadAllText(Path.Combine(root, "config/a")) == "one", "Incomplete backup blocked rollback");
+        });
+        Test("failed archive update preserves instance and reuses verified downloads", root => {
+            string author = Path.Combine(root, "author"), player = Path.Combine(root, "player"), zip = Path.Combine(root, "pack.zip");
+            Write(author, "config/a.toml", "first");
+            Write(player, "config/a.toml", "first");
+            var publisher = new PackPublisher(author);
+            publisher.SaveBaseline(publisher.Scan(PackPublisher.DefaultFolders));
+            Write(author, "config/a.toml", "second");
+            Write(author, "mods/optional.jar", "optional");
+            Write(author, "mods/required.jar", "required");
+            var files = publisher.Scan(PackPublisher.DefaultFolders);
+            foreach (var file in files.Where(f => f.Category == "mod")) file.Urls.Add("https://example.com/" + System.IO.Path.GetFileName(file.Path));
+            files.Single(f => f.Path == "mods/optional.jar").Optional = true;
+            var release = publisher.Build(Details(), files, 1, zip, "https://example.com");
+            var updater = new PackUpdater(player);
+            string manual = Path.Combine(root, "manual.jar");
+            System.IO.File.WriteAllText(manual, "required", new UTF8Encoding(false));
+            int slices = 0;
+            var options = new PackDownloadOptions { DownloadRange = LocalRanges(zip, _ => slices++), SkipOptional = _ => true };
+            void unavailable(string _, string __, long ___) => throw new IOException("offline");
+            Throws(() => updater.Apply(updater.Plan(release, Array.Empty<string>()), () => new PackRuntime(), _ => { }, unavailable, options));
+            Assert(System.IO.File.ReadAllText(Path.Combine(player, "config/a.toml")) == "first" && !updater.NeedsRecovery, "Download failure modified the player instance");
+            options.SelectLocalFile = (path, _) => path.EndsWith("required.jar", StringComparison.Ordinal) ? manual : null;
+            updater.Apply(updater.Plan(release, Array.Empty<string>()), () => new PackRuntime(), _ => { }, unavailable, options);
+            Assert(slices == 1, "Already verified file was downloaded again");
+            Assert(System.IO.File.Exists(Path.Combine(player, "mods/required.jar")) && !System.IO.File.Exists(Path.Combine(player, "mods/optional.jar")), "Optional/manual handling failed");
+        });
+        Test("Xaero world map and public waypoints preserve player data", root => {
+            string author = Path.Combine(root, "author"), player = Path.Combine(root, "player"), zip = Path.Combine(root, "pack.zip");
+            const string source = "xaero/world-map/Multiplayer_test/null/cm$author";
+            const string waypoint = "xaero/minimap/Multiplayer_test/dim%0/mw$1.txt";
+            Write(author, "config/base.toml", "baseline");
+            Write(player, "config/base.toml", "baseline");
+            Write(author, source + "/0_0.zip", "map");
+            Write(author, waypoint, "public");
+            Write(player, "xaero/world-map/Multiplayer_test/null/cm$player/0_0.zip", "existing map");
+            Write(player, waypoint, "player waypoint");
+            var publisher = new PackPublisher(author);
+            publisher.SaveBaseline(publisher.Scan(PackPublisher.DefaultFolders));
+            string destination = publisher.ImportXaeroMap(Path.Combine(author, source), "season-2");
+            publisher.ImportXaeroWaypoints(Path.Combine(author, waypoint));
+            Write(author, source + "/0_0.zip", "modified after import");
+            var release = publisher.Build(Details(), publisher.Scan(PackPublisher.DefaultFolders), 1, zip, "https://example.com");
+            var updater = new PackUpdater(player);
+            updater.Apply(updater.Plan(release, Array.Empty<string>()), () => new PackRuntime(), _ => { },
+                options: new PackDownloadOptions { DownloadRange = LocalRanges(zip) });
+            Assert(System.IO.File.ReadAllText(Path.Combine(player, destination, "0_0.zip")) == "map", "Published map was not frozen");
+            Assert(System.IO.File.ReadAllText(Path.Combine(player, waypoint)) == "player waypoint", "Existing waypoints were overwritten");
+            Assert(System.IO.File.Exists(Path.Combine(player, "xaero/world-map/Multiplayer_test/null/cm$player/0_0.zip")), "Player map was replaced");
+        });
+        Test("archive plan validates fallback bounds and can extract a complete ZIP", root => {
+            Write(root, "config/base.toml", "first");
+            Write(root, "config/second.toml", "second");
+            var publisher = new PackPublisher(root);
+            publisher.SaveBaseline(publisher.Scan(PackPublisher.DefaultFolders));
+            string zip = Path.Combine(root, "pack.zip");
+            var manifest = publisher.Build(Details(), publisher.Scan(PackPublisher.DefaultFolders), 1, zip, "https://example.com");
+            var entry = (JObject)manifest["files"]![0]!;
+            using var archive = new PackArchive((JObject)manifest["archive"]!, zip, _ => { }, _ => throw new Exception(),
+                (_, _, _, _, _) => throw new Exception("A complete verified archive should be reused"));
+            string output = Path.Combine(root, "extracted");
+            archive.Extract(entry, output, Path.Combine(root, "scratch"));
+            Assert(System.IO.File.ReadAllText(output) == "first", "Complete ZIP extraction failed");
+            archive.Extract((JObject)manifest["files"]![1]!, output, Path.Combine(root, "scratch"));
+            Assert(System.IO.File.ReadAllText(output) == "second", "Second indexed ZIP entry extraction failed");
+            entry["entry"]!["offset"] = (long)manifest["archive"]!["size"]!;
+            Throws(() => PackProtocol.Validate(manifest, "release"));
         });
         Console.WriteLine($"{passed} tests passed");
     }

@@ -8,7 +8,7 @@ Public Module ModPackUpdate
             If Not FileUtils.IsAvailable(Native) Then Throw New Exception("游戏仍在使用文件，请关闭游戏后重试。")
         Next
     End Sub
-    Private Function Current(Instance As McInstance) As McComponents
+    Public Function ReadPackRuntime(Instance As McInstance) As McComponents
         Instance.Config.DiscardCache()
         Dim Manifest = Configs.McInstallManifest.Get(Instance.Config)
         Dim Result = If(Manifest IsNot Nothing, Manifest.Components, Nothing)
@@ -28,7 +28,7 @@ Public Module ModPackUpdate
     End Function
     Public Function CheckRuntime(Instance As McInstance, Release As JObject) As String
         CheckIdle(Instance)
-        Dim Existing = Current(Instance)
+        Dim Existing = ReadPackRuntime(Instance)
         If Existing.MinecraftVersion <> CStr(Release("runtime")("minecraft")) Then Throw New Exception("此更新需要 Minecraft " & CStr(Release("runtime")("minecraft")) & "。请在下载页面安装独立实例后绑定更新源。")
         Dim OldVersion = Existing.ModLoaderVersions(ModLoaders.NeoForge)
         Dim NewVersion = CStr(Release("runtime")("loader")("version"))
@@ -39,7 +39,7 @@ Public Module ModPackUpdate
     End Function
     Public Function PrepareRuntime(Instance As McInstance, Release As JObject) As PackRuntime
         CheckRuntime(Instance, Release)
-        Dim Existing = Current(Instance)
+        Dim Existing = ReadPackRuntime(Instance)
         Dim NewVersion = CStr(Release("runtime")("loader")("version"))
         Dim Runtime As New PackRuntime
         If Existing.ModLoaderVersions(ModLoaders.NeoForge) = NewVersion Then Return Runtime

@@ -345,6 +345,13 @@
     <Compile Include="Pages\PageInstance\PageInstancePackUpdate.xaml.vb">
       <DependentUpon>PageInstancePackUpdate.xaml</DependentUpon>
     </Compile>
+    <Compile Include="Pages\PageInstance\PageInstancePackPublish.xaml.vb">
+      <DependentUpon>PageInstancePackPublish.xaml</DependentUpon>
+    </Compile>
+    <Page Include="Pages\PageInstance\PageInstancePackPublish.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
     <Page Include="Pages\PageInstance\PageInstancePackUpdate.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>

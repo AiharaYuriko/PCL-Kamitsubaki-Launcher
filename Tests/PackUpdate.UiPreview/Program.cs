@@ -6,6 +6,8 @@ using System.Windows.Controls;
 internal static class Program {
     [STAThread]
     static void Main(string[] args) {
+        bool verifyPublisher = args.Contains("--verify-publisher");
+        string root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, verifyPublisher ? "verify-" + Guid.NewGuid().ToString("N") : "preview-instance");
         try {
             MeloongCore.Main.Init("PCL UI Preview");
             MeloongCore.Wpf.Main.Init();
@@ -13,7 +15,6 @@ internal static class Program {
             app.InitializeComponent();
             app.Startup -= (StartupEventHandler)Delegate.CreateDelegate(typeof(StartupEventHandler), app, typeof(PCL.Application).GetMethod("Application_Startup", BindingFlags.Instance | BindingFlags.NonPublic));
             typeof(Application).GetField("_startupUri", BindingFlags.Instance | BindingFlags.NonPublic).SetValue(app, null);
-            string root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "preview-instance");
             Directory.CreateDirectory(root);
             var instance = new PCL.ModMinecraft.McInstance(root + "\\");
             var page = new PCL.PageInstancePackUpdate(instance);
@@ -25,8 +26,13 @@ internal static class Program {
             DockPanel.SetDock(sidebar, Dock.Left); layout.Children.Add(sidebar); layout.Children.Add(page);
             var window = new Window { Title = "PCL 内置页面布局验证", Content = layout, Width = 960, Height = 700, Background = (System.Windows.Media.Brush)app.Resources["ColorBrush8"] };
             // Exercise the real window and its PCL list controls with fixture data only.
+            object Field(string name) => typeof(PCL.PageInstancePackUpdate).GetProperty(name, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public).GetValue(page);
+            if (verifyPublisher) {
+                VerifyPublisher(root, instance, page);
+                app.Shutdown();
+                return;
+            }
             if (!args.Contains("--empty")) {
-                object Field(string name) => typeof(PCL.PageInstancePackUpdate).GetProperty(name, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public).GetValue(page);
                 var choices = (ComboBox)Field("Choices");
                 window.ContentRendered += (_, _) => {
                     choices.Items.Add(new ComboBoxItem { Content = "神椿市搬砖中 · stable" }); choices.SelectedIndex = 0;
@@ -39,6 +45,50 @@ internal static class Program {
             }
             window.ShowDialog();
             app.Shutdown();
-        } catch (Exception ex) { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ui-error.txt"), ex.ToString()); }
+        } catch (Exception ex) {
+            File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ui-error.txt"), ex.ToString());
+            Environment.ExitCode = 1;
+        }
+    }
+
+    private static void VerifyPublisher(string root, PCL.ModMinecraft.McInstance instance, PCL.PageInstancePackUpdate updaterPage) {
+        const BindingFlags members = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+        var setup = new PCL.PageSetupSystem();
+        var toggle = (PCL.MyCheckBox)typeof(PCL.PageSetupSystem).GetProperty("CheckPackPublish", members).GetValue(setup);
+        string key = PCL.SettingService.GetKey(toggle);
+        if (key != "ToolPackPublish") throw new InvalidOperationException("The global checkbox is missing its setting.");
+        var setting = PCL.Settings.Entries[key];
+        if ((bool)setting.DefaultValue) throw new InvalidOperationException("Publishing is enabled by default.");
+        var nav = new PCL.PageInstanceLeft();
+        var entry = (PCL.MyListItem)typeof(PCL.PageInstanceLeft).GetProperty("ItemPackPublish", members).GetValue(nav);
+        var part = PCL.FormMain.PageSubType.InstancePackPublish;
+        PCL.PageInstanceLeft.Instance = instance;
+
+        // Use the actual settings cache without writing to the user's registry.
+        setting.Set(setting.DefaultValue, null);
+        PCL.SettingService.RefreshSettings(toggle);
+        nav.RefreshPackPublishEntry();
+        if (toggle.Checked || entry.Visibility != Visibility.Collapsed || nav.PageGet(part) is not PCL.PageInstanceOverall)
+            throw new InvalidOperationException("The default setting exposed the publish page.");
+        setting.Set(true, null);
+        PCL.SettingService.RefreshSettings(toggle);
+        nav.RefreshPackPublishEntry();
+        if (!toggle.Checked || entry.Visibility != Visibility.Visible || nav.PageGet(part) is not PCL.PageInstancePackPublish first ||
+            first.InstancePath != instance.PathVersion)
+            throw new InvalidOperationException("The setting did not open publishing for the first instance.");
+        var secondRoot = Path.Combine(root, "another");
+        Directory.CreateDirectory(secondRoot);
+        var second = new PCL.ModMinecraft.McInstance(secondRoot + "\\");
+        PCL.PageInstanceLeft.Instance = second;
+        nav.RefreshPackPublishEntry();
+        if (entry.Visibility != Visibility.Visible || nav.PageGet(part) is not PCL.PageInstancePackPublish secondPage ||
+            secondPage.InstancePath != second.PathVersion || ReferenceEquals(first, secondPage))
+            throw new InvalidOperationException("The setting did not open publishing for the second instance.");
+        if (updaterPage.FindName("PublishCard") != null || secondPage.FindName("PublishCard") is not PCL.MyCard card || card.Visibility != Visibility.Visible)
+            throw new InvalidOperationException("The update and publish pages are not separate.");
+        setting.Set(false, null);
+        nav.RefreshPackPublishEntry();
+        if (entry.Visibility != Visibility.Collapsed || nav.PageGet(part) is not PCL.PageInstanceOverall)
+            throw new InvalidOperationException("Disabling the global setting did not close access.");
     }
 }

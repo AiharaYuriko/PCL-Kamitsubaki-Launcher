@@ -55,6 +55,22 @@ try {
     Copy-Item -LiteralPath 'Plain Craft Launcher 2/bin/Plain Craft Launcher 2.exe' -Destination $exe -Force
     $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
     [IO.File]::WriteAllText((Join-Path $output 'SHA256SUMS.txt'), "$hash  PCL-Kamitsubaki.exe`n")
+    if ($Configuration -eq 'Release') {
+        $versionName = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe).FileVersion
+        $versionSource = [IO.File]::ReadAllText((Join-Path $repoRoot 'Plain Craft Launcher 2/Modules/Base/ModBase.vb'))
+        $releaseCode = [regex]::Match($versionSource, '(?im)^#If RELEASE Then\s+Public Const VersionCode As Integer = (\d+)')
+        if (-not $releaseCode.Success) { throw 'Unable to read the release VersionCode.' }
+        $manifest = [ordered]@{
+            productId = (Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json).ProductId
+            versionCode = [int]$releaseCode.Groups[1].Value
+            versionName = $versionName
+            important = $false
+            changelog = "Release v$versionName"
+            downloadUrl = "https://github.com/AiharaYuriko/PCL-Kamitsubaki-Launcher/releases/download/v$versionName/PCL-Kamitsubaki.exe"
+            sha256 = $hash
+        }
+        [IO.File]::WriteAllText((Join-Path $output 'update.json'), ($manifest | ConvertTo-Json))
+    }
     Write-Host "Built: $exe"
     Write-Host "SHA256: $hash"
 } finally {

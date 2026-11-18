@@ -12,12 +12,24 @@ public sealed class PackChange {
     public string Reason { get; set; } = "";
     public string? Before { get; set; }
     public JObject? File { get; set; }
+    internal string? DependsOn { get; set; }
+    internal string? ToggleDestination => Kind switch {
+        "禁用" => Path + ".disabled",
+        "启用" => PackProtocol.EnabledModPath(Path),
+        _ => null
+    };
 }
 public sealed class PackPlan {
     public JObject Release { get; set; } = new();
     public JObject State { get; set; } = new();
     public List<PackChange> Changes { get; } = new();
     public HashSet<string> Selected { get; set; } = new();
+    public List<string> Preserved { get; } = new();
+    public int? BaselineMatches { get; internal set; }
+    internal List<JObject> RetainedRecords { get; } = new();
+    internal Dictionary<string, JObject> PriorForOptional { get; } = new(StringComparer.OrdinalIgnoreCase);
+    internal Dictionary<string, string> FileTargets { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public bool IsApplied => (string?)Release["schema"] == PackProtocol.ArchiveRelease && (long?)State["sequence"] == (long?)Release["release"]?["sequence"];
     public long Bytes => Changes.Where(c => c.File != null).Sum(c => (long)c.File!["size"]!);
 }
 public sealed class PackRuntime {
@@ -27,7 +39,7 @@ public sealed class PackRuntime {
 }
 
 /// <summary>One instance, one transaction, one retained rollback. Caller holds the PCL instance lock.</summary>
-public sealed class PackUpdater {
+public sealed partial class PackUpdater {
     private readonly string root;
     private string Work(string relative) => PackProtocol.Safe(root, ".pcl-update/" + relative, true);
     public PackUpdater(string root) { this.root = System.IO.Path.GetFullPath(root); }
@@ -63,8 +75,15 @@ public sealed class PackUpdater {
         var choice = new HashSet<string>(selected);
         foreach (var c in release["components"]!) if ((bool)c["required"]!) choice.Add((string)c["id"]!);
         var plan = new PackPlan { Release = (JObject)release.DeepClone(), State = state, Selected = choice };
+        if ((string?)release["schema"] == PackProtocol.ArchiveRelease) return PlanArchive(plan);
+        var previous = (state["files"] as JArray ?? new JArray()).Cast<JObject>().ToDictionary(f => (string)f["path"]!, StringComparer.OrdinalIgnoreCase);
         foreach (JObject file in release["files"]!.Where(f => Included(f, choice))) {
             string path = (string)file["path"]!; string? hash = Hash(path);
+            if (hash != null && previous.TryGetValue(path, out var old) && PartialConfig(plan, old)) {
+                plan.Preserved.Add(path);
+                plan.RetainedRecords.Add(old);
+                continue;
+            }
             if ((string?)file["write_policy"] == "preserve" && hash != null) continue;
             if (hash == (string?)file["sha256"]) continue;
             Add(plan, file, hash == null ? "新增" : "更新 / 修复", hash, file);
@@ -85,6 +104,7 @@ public sealed class PackUpdater {
             string path = (string)old["path"]!;
             if (targets.Contains(path) || plan.Changes.Any(c => c.Path.Equals(path, StringComparison.OrdinalIgnoreCase))) continue;
             string? hash = Hash(path); if (hash == null) continue;
+            if (PartialConfig(plan, old)) { plan.Preserved.Add(path); plan.RetainedRecords.Add(old); continue; }
             if (hash != (string?)old["sha256"]) throw new IOException("旧文件有本地修改，自动清理已停止：" + path);
             Add(plan, old, "删除", hash, null);
         }
@@ -94,16 +114,28 @@ public sealed class PackUpdater {
         Path = (string)item["path"]!, Name = (string?)item["display"]?["name"] ?? (string)item["path"]!, Icon = (string?)item["display"]?["icon_url"] ?? "",
         Kind = kind, Before = hash, File = file, Reason = (string?)item["reason"] ?? ""
     });
-    public void Apply(PackPlan preview, Func<PackRuntime> prepareRuntime, Action<string> progress, Action<string, string, long>? download = null) {
+    public void Apply(PackPlan preview, Func<PackRuntime> prepareRuntime, Action<string> progress, Action<string, string, long>? download = null,
+        PackDownloadOptions? options = null) {
         if (NeedsRecovery) throw new IOException("请先恢复上次更新。");
         var plan = Plan(preview.Release, preview.Selected);
         if (Signature(plan) != Signature(preview)) throw new IOException("本地文件已变化，请重新检查更新。");
+        if (plan.IsApplied) { progress("此版本已应用。"); return; }
+        bool archived = (string?)plan.Release["schema"] == PackProtocol.ArchiveRelease;
         var stage = Work("stage"); Clear(stage); Directory.CreateDirectory(stage);
         try {
+            var staged = new Dictionary<PackChange, string>();
+            var skipped = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             int index = 0;
+            using (var archive = archived ? new PackArchive((JObject)plan.Release["archive"]!, Work("downloads/" + (string)plan.Release["archive"]!["sha256"]! + ".zip"),
+                progress, options?.ApproveWholeArchive, options?.DownloadRange) : null)
             foreach (var change in plan.Changes.Where(c => c.File != null)) {
+                if (archived) {
+                    if (!StageArchiveFile(change, archive!, staged, progress, download, options)) skipped.Add(change.Path);
+                    continue;
+                }
                 var file = change.File!; string target = Work("stage/" + index++); Exception? error = null;
-                foreach (string url in file["urls"]!.Values<string>()) {
+                foreach (var address in file["urls"]!) {
+                    string url = address.Value<string>()!;
                     try {
                         progress("正在下载：" + change.Name);
                         if (download != null) download(url, target, (long)file["size"]!);
@@ -113,46 +145,79 @@ public sealed class PackUpdater {
                     } catch (Exception ex) { error = ex; }
                 }
                 if (error != null) throw error;
+                staged[change] = target;
             }
             progress("正在准备游戏运行环境……"); var runtime = prepareRuntime();
-            if (plan.Changes.Count == 0 && runtime.Paths.Count == 0 && (string?)plan.State["release_id"] == (string?)plan.Release["release"]!["id"] && new HashSet<string>(plan.State["selected"]?.Values<string>() ?? Enumerable.Empty<string>()).SetEquals(plan.Selected)) { progress("已是最新，文件检查通过。"); return; }
+            if (plan.Changes.Count == 0 && runtime.Paths.Count == 0 && (string?)plan.State["release_id"] == (string?)plan.Release["release"]!["id"] &&
+                new HashSet<string>((plan.State["selected"] as JArray ?? new JArray()).Select(item => item.Value<string>()!)).SetEquals(plan.Selected)) {
+                progress("已是最新，文件检查通过。"); return;
+            }
             if (Signature(Plan(preview.Release, preview.Selected)) != Signature(plan)) throw new IOException("下载期间本地文件发生变化，请重新检查。");
-            var paths = plan.Changes.Select(c => c.Path).Concat(plan.Changes.Where(c => c.Kind == "禁用").Select(c => c.Path + ".disabled")).Concat(runtime.Paths).Append(".pcl-update/state.json").Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var changes = plan.Changes.Where(c => !skipped.Contains(c.Path) &&
+                (c.DependsOn == null || !skipped.Contains(c.DependsOn))).ToList();
+            var paths = changes.Select(c => c.Path).Concat(changes.Select(c => c.ToggleDestination).OfType<string>()).Concat(runtime.Paths).Append(".pcl-update/state.json").Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             if (paths.Any(p => p.StartsWith(".pcl-update/", StringComparison.OrdinalIgnoreCase) && p != ".pcl-update/state.json")) throw new IOException("运行环境请求修改更新器内部文件。");
-            string pending = Work("pending"); Clear(pending); Directory.CreateDirectory(pending);
+            string pending = Work("pending");
+            Clear(pending); // Older builds could leave an unpublished backup here.
+            string backupFolder = Work("stage/backup");
+            Directory.CreateDirectory(backupFolder);
             var entries = new JArray(); int n = 0;
             foreach (string path in paths) {
                 string source = PackProtocol.Safe(root, path, true); bool exists = File.Exists(source);
                 string backup = "files/" + n++;
-                if (exists) { string dest = PackProtocol.Safe(pending, backup, true); Directory.CreateDirectory(System.IO.Path.GetDirectoryName(dest)!); File.Copy(source, dest); }
+                if (exists) { string dest = PackProtocol.Safe(backupFolder, backup, true); Directory.CreateDirectory(System.IO.Path.GetDirectoryName(dest)!); File.Copy(source, dest); }
                 entries.Add(new JObject { ["path"] = path, ["backup"] = backup, ["existed"] = exists });
             }
             var journal = new JObject { ["status"] = "applying", ["files"] = entries };
-            Atomic(Work("pending/journal.json"), journal);
+            Atomic(Work("stage/backup/journal.json"), journal);
+            Directory.Move(backupFolder, pending);
             try {
-                progress("正在应用运行环境……"); runtime.Commit(); index = 0;
-                foreach (var change in plan.Changes) {
+                progress("正在应用运行环境……"); runtime.Commit();
+                foreach (var change in changes) {
                     string target = PackProtocol.Safe(root, change.Path);
                     progress(change.Kind + "：" + change.Name);
-                    if (change.File != null) { Directory.CreateDirectory(System.IO.Path.GetDirectoryName(target)!); File.Copy(Work("stage/" + index++), target, true); }
-                    else if (change.Kind == "禁用") { string disabled = PackProtocol.Safe(root, change.Path + ".disabled"); if (!File.Exists(disabled)) File.Copy(target, disabled); File.Delete(target); }
+                    if (change.File != null) {
+                        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(target)!);
+                        File.Copy(staged[change], target, true);
+                        if (Hash(change.Path) != PackProtocol.HashFile(staged[change])) throw new IOException("更新后校验失败：" + change.Path);
+                    }
+                    else if (change.ToggleDestination is string destination) {
+                        string fullPath = PackProtocol.Safe(root, destination);
+                        if (!File.Exists(fullPath)) File.Move(target, fullPath);
+                        else if (Hash(destination) == change.Before) File.Delete(target);
+                        else throw new IOException("Mod 启停状态切换目标已改变：" + destination);
+                    }
                     else File.Delete(target);
                 }
                 runtime.Verify();
-                foreach (var file in plan.Release["files"]!.Where(f => Included(f, plan.Selected) && (string?)f["write_policy"] == "replace"))
+                var retainedConfigs = new HashSet<string>(plan.RetainedRecords.Select(f => (string)f["path"]!), StringComparer.OrdinalIgnoreCase);
+                if (!archived) foreach (var file in plan.Release["files"]!.Where(f => Included(f, plan.Selected) && (string?)f["write_policy"] == "replace" && !retainedConfigs.Contains((string)f["path"]!)))
                     if (Hash((string)file["path"]!) != (string?)file["sha256"]) throw new IOException("更新后校验失败：" + (string)file["path"]!);
                 var owned = new JArray();
                 var allTargets = new HashSet<string>(plan.Release["files"]!.Where(f => Included(f, plan.Selected)).Select(f => (string)f["path"]!), StringComparer.OrdinalIgnoreCase);
                 foreach (JObject old in (plan.State["files"] as JArray ?? new JArray()).Where(f => !Included(f, CleanupChoice(plan)))) if (!allTargets.Contains((string)old["path"]!)) owned.Add(old.DeepClone());
-                foreach (JObject file in plan.Release["files"]!.Where(f => Included(f, plan.Selected) && (string?)f["write_policy"] == "replace")) owned.Add(new JObject { ["path"] = file["path"]!.DeepClone(), ["sha256"] = file["sha256"]!.DeepClone(), ["component"] = file["component"]?.DeepClone() });
+                if (archived) RecordArchiveOwnership(plan, owned, skipped);
+                else {
+                    foreach (var config in plan.RetainedRecords) owned.Add(config.DeepClone());
+                    foreach (JObject file in plan.Release["files"]!.Where(f => Included(f, plan.Selected) && (string?)f["write_policy"] == "replace" && !retainedConfigs.Contains((string)f["path"]!)))
+                        owned.Add(new JObject { ["path"] = file["path"]!.DeepClone(), ["sha256"] = file["sha256"]!.DeepClone(), ["whole_file"] = true, ["component"] = file["component"]?.DeepClone() });
+                }
                 Atomic(Work("state.json"), new JObject { ["pack_id"] = plan.Release["pack"]!["id"]!.DeepClone(), ["channel"] = plan.Release["release"]!["channel"]!.DeepClone(), ["release_id"] = plan.Release["release"]!["id"]!.DeepClone(), ["sequence"] = plan.Release["release"]!["sequence"]!.DeepClone(), ["runtime"] = plan.Release["runtime"]!.DeepClone(), ["selected"] = new JArray(plan.Selected), ["files"] = owned, ["manifest_hash"] = PackProtocol.Hash(Encoding.UTF8.GetBytes(plan.Release.ToString(Formatting.None))) });
                 foreach (JObject entry in entries) entry["after"] = Hash((string)entry["path"]!, true);
                 journal["status"] = "committed"; Atomic(Work("pending/journal.json"), journal);
             } catch { Restore("pending", false); throw; }
-            Finish(); progress("更新完成，可以启动游戏。已保留最近一次回退备份。");
+            Finish();
+            if (archived) {
+                try { Clear(Work("downloads")); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+            progress("更新完成，可以启动游戏。已保留最近一次回退备份。");
         } finally { Clear(stage); }
     }
-    private static string Signature(PackPlan plan) => string.Join("\n", plan.Changes.Select(c => c.Path + "|" + c.Kind + "|" + c.Before)) + plan.State.ToString(Formatting.None);
+    private static string Signature(PackPlan plan) => string.Join("\n", plan.Changes.Select(c => c.Path + "|" + c.Kind + "|" + c.Before + "|" + c.DependsOn))
+        + string.Join("\n", plan.FileTargets.Select(pair => pair.Key + "|" + pair.Value))
+        + string.Join("\n", plan.RetainedRecords.Select(item => (string)item["path"]!)) + plan.State.ToString(Formatting.None);
     private static HashSet<string> CleanupChoice(PackPlan plan) {
         var result = new HashSet<string>(plan.Selected);
         var defined = new HashSet<string>(plan.Release["components"]!.Select(c => (string)c["id"]!));
@@ -166,6 +231,7 @@ public sealed class PackUpdater {
     }
     public void Rollback() {
         if (NeedsRecovery) { Recover(); return; }
+        Clear(Work("pending")); // Discard an incomplete pre-journal backup from an older build.
         var journal = PackProtocol.Parse(File.ReadAllBytes(Work("previous/journal.json")));
         foreach (var entry in journal["files"]!) if (Hash((string)entry["path"]!, true) != (string?)entry["after"]) throw new IOException("更新后文件发生变化，无法自动回退：" + (string)entry["path"]!);
         journal["status"] = "restoring";
@@ -185,14 +251,14 @@ public sealed class PackUpdater {
         Clear(Work(folder));
     }
     private void Finish() { Clear(Work("previous")); Directory.Move(Work("pending"), Work("previous")); }
-    private static void Atomic(string path, JObject value) {
+    internal static void Atomic(string path, JObject value) {
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!); string temporary = path + ".tmp";
         File.WriteAllText(temporary, value.ToString(Formatting.Indented), new UTF8Encoding(false));
         if (File.Exists(path)) File.Replace(temporary, path, null); else File.Move(temporary, path);
     }
     private void Clear(string path) {
-        // Delete only the three fixed transaction directories, and never follow reparse points.
-        if (!new[] { Work("stage"), Work("pending"), Work("previous") }.Contains(path, StringComparer.OrdinalIgnoreCase)) throw new IOException("无效的清理目录。");
+        // Delete only fixed transaction directories, and never follow reparse points.
+        if (!new[] { Work("stage"), Work("pending"), Work("previous"), Work("downloads") }.Contains(path, StringComparer.OrdinalIgnoreCase)) throw new IOException("无效的清理目录。");
         if (!Directory.Exists(path)) return;
         DeleteTree(path);
     }
