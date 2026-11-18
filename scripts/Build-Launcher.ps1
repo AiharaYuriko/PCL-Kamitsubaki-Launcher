@@ -63,12 +63,15 @@ try {
         $versionSource = [IO.File]::ReadAllText((Join-Path $repoRoot 'Plain Craft Launcher 2/Modules/Base/ModBase.vb'))
         $releaseCode = [regex]::Match($versionSource, '(?im)^#If RELEASE Then\s+Public Const VersionCode As Integer = (\d+)')
         if (-not $releaseCode.Success) { throw 'Unable to read the release VersionCode.' }
+        $history = Get-Content -LiteralPath (Join-Path $repoRoot 'Plain Craft Launcher 2/PCL.ReleaseNotes.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $entry = @($history | Where-Object { $_.code -eq [int]$releaseCode.Groups[1].Value -and $_.version -eq $versionName })
+        if ($entry.Count -ne 1 -or [string]::IsNullOrWhiteSpace($entry[0].notes)) { throw "Missing or ambiguous release notes for $versionName." }
         $manifest = [ordered]@{
             productId = (Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json).ProductId
             versionCode = [int]$releaseCode.Groups[1].Value
             versionName = $versionName
             important = $false
-            changelog = "Release v$versionName"
+            changelog = $entry[0].notes
             downloadUrl = "https://github.com/AiharaYuriko/PCL-Kamitsubaki-Launcher/releases/download/v$versionName/PCL-Kamitsubaki.exe"
             sha256 = $hash
         }

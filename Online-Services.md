@@ -17,7 +17,7 @@
 
 MicrosoftClientId 由构建流程注入，Minecraft 应用审核与真实登录测试待完成；启动器默认从本仓库最新 GitHub Release 的 `update.json` 检查更新。公告地址可自行配置。微软应用需支持个人账号设备代码登录及 Minecraft 服务访问。
 
-更新和公告可以放在已有对象存储的独立目录，例如 `launcher/update.json` 和 `launcher/announcements.json`，不要覆盖整合包更新清单。先发布完整、可独立运行的 EXE，再发布清单。不支持 ZIP、差分包或多文件部署；需要随 EXE 分发依赖的构建不能使用此更新方式。每次发布递增 `ModBase.vb` 中的版本名及 VersionCode，同步 `AssemblyInfo.vb` 的文件版本。Release 构建自动生成 `update.json`；将它与同次构建的 `PCL-Kamitsubaki.exe` 和 `SHA256SUMS.txt` 一起发布到标签 `v<文件版本>` 的最新正式 Release。早期定制版可设置 `PCL_UPDATE_URL=https://github.com/AiharaYuriko/PCL-Kamitsubaki-Launcher/releases/latest/download/update.json` 并重启后检查更新。
+更新和公告可以放在已有对象存储的独立目录，例如 `launcher/update.json` 和 `launcher/announcements.json`，不要覆盖整合包更新清单。先发布完整、可独立运行的 EXE，再发布清单。不支持 ZIP、差分包或多文件部署；需要随 EXE 分发依赖的构建不能使用此更新方式。每次发布递增 `ModBase.vb` 中的版本名及 VersionCode，同步 `AssemblyInfo.vb` 的文件版本，并在 `PCL.ReleaseNotes.json` 中添加正式版版本码、版本名和用户可读的更新说明。启动后的升级弹窗和下载前的更新清单共用这些说明。Release 构建自动生成 `update.json`；将它与同次构建的 `PCL-Kamitsubaki.exe` 和 `SHA256SUMS.txt` 一起发布到标签 `v<文件版本>` 的最新正式 Release。早期定制版可设置 `PCL_UPDATE_URL=https://github.com/AiharaYuriko/PCL-Kamitsubaki-Launcher/releases/latest/download/update.json` 并重启后检查更新。
 
 更新清单示例（哈希必须替换为实际 EXE 的 SHA-256）：
 
