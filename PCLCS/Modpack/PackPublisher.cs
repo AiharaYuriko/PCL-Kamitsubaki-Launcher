@@ -63,7 +63,14 @@ public sealed class PackPublisher(string root) {
     }
     public void SaveCredentials(string access, string secret, bool mirror = false) {
         string path = ProjectFile(mirror ? "mirror-credentials.json" : "credentials.json");
-        if (access.Length == 0 || secret.Length == 0) { File.Delete(path); return; }
+        if (access.Length == 0 && secret.Length == 0) {
+            try {
+                File.Delete(path);
+                File.Delete(path + ".tmp");
+            }
+            catch (DirectoryNotFoundException) { }
+            return;
+        }
         var bytes = PackR2Publisher.JsonBytes(new JObject { ["access"] = access, ["secret"] = secret });
         var encrypted = ProtectedData.Protect(bytes, null, DataProtectionScope.CurrentUser);
         PackUpdater.Atomic(path, new JObject { ["encrypted"] = Convert.ToBase64String(encrypted) });

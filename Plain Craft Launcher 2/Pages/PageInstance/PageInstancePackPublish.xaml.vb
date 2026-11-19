@@ -57,7 +57,7 @@ Public Class PageInstancePackPublish
             Dim MirrorCredentials = Publisher.ReadCredentials(mirror:=True)
             PublishMirrorAccess.Text = CStr(MirrorCredentials("access"))
             PublishMirrorSecret.Password = If(CStr(MirrorCredentials("secret")), "")
-            PublishRemember.Checked = Credentials.HasValues OrElse MirrorCredentials.HasValues
+            PublishRemember.Checked = If(CType(Saved("remember_credentials"), Boolean?), Credentials.HasValues OrElse MirrorCredentials.HasValues)
             Dim Latest = Publisher.Latest
             PublishedAddress = PackPublisher.PublishedSource(Latest)
             If Not String.IsNullOrEmpty(PublishedAddress) Then
@@ -68,7 +68,43 @@ Public Class PageInstancePackPublish
         Catch ex As Exception
             PublishStatus.Text = "加载发布项目失败：" & ex.Message
         End Try
+        AddHandler PublishRemember.Change, Sub() SaveRememberChoice()
+        AddHandler PublishAccess.TextChanged, Sub() SaveEditedCredentials(False)
+        AddHandler PublishSecret.PasswordChanged, Sub() SaveEditedCredentials(False)
+        AddHandler PublishMirrorAccess.TextChanged, Sub() SaveEditedCredentials(True)
+        AddHandler PublishMirrorSecret.PasswordChanged, Sub() SaveEditedCredentials(True)
         UpdatePublisherControls()
+    End Sub
+
+    Private Sub SaveRememberChoice()
+        Try
+            SaveCurrentCredentials(False)
+            SaveCurrentCredentials(True)
+            Dim Saved = Publisher.Settings
+            Saved("remember_credentials") = PublishRemember.Checked
+            Publisher.SaveSettings(Saved)
+        Catch ex As Exception
+            PublishStatus.Text = "无法保存凭据设置：" & ex.Message
+        End Try
+    End Sub
+
+    Private Sub SaveEditedCredentials(Mirror As Boolean)
+        If Not PublishRemember.Checked Then Return
+        Try
+            SaveCurrentCredentials(Mirror)
+        Catch ex As Exception
+            PublishStatus.Text = "无法保存发布凭据：" & ex.Message
+        End Try
+    End Sub
+
+    Private Sub SaveCurrentCredentials(Mirror As Boolean)
+        If Not PublishRemember.Checked Then
+            Publisher.SaveCredentials("", "", Mirror)
+        ElseIf Mirror Then
+            Publisher.SaveCredentials(PublishMirrorAccess.Text.Trim(), PublishMirrorSecret.Password, mirror:=True)
+        Else
+            Publisher.SaveCredentials(PublishAccess.Text.Trim(), PublishSecret.Password)
+        End If
     End Sub
 
     Private Sub SetBusy(Value As Boolean)
@@ -235,8 +271,8 @@ Public Class PageInstancePackPublish
         }, Nothing)
         Dim Persist = New JObject From {{"name", Info.Name}, {"id", Info.PackId}, {"channel", Info.Channel}, {"folders", PublishFolders.Text}, {"files", PublishFilePaths.Text},
             {"account", Settings.Account}, {"bucket", Settings.Bucket}, {"root", Settings.PublicRoot}, {"sync_mirror", PublishMirror.Checked},
-            {"mirror_bucket", PublishMirrorBucket.Text.Trim()}, {"mirror_root", PublishMirrorRoot.Text.Trim()}}
-        Dim Remember = PublishRemember.Checked
+            {"mirror_bucket", PublishMirrorBucket.Text.Trim()}, {"mirror_root", PublishMirrorRoot.Text.Trim()},
+            {"remember_credentials", PublishRemember.Checked}}
         SetBusy(True)
         Dim Worker As New RedoableWorker(
             Sub()
@@ -250,12 +286,6 @@ Public Class PageInstancePackPublish
                         Publisher.Export(Info, PreviewFiles, Output)
                         RunInUi(Sub() PublishStatus.Text = "测试 ZIP 已导出：" & Output)
                     Else
-                        Publisher.SaveCredentials(If(Remember, Settings.AccessKey, ""), If(Remember, Settings.SecretKey, ""))
-                        If MirrorSettings IsNot Nothing Then
-                            Publisher.SaveCredentials(If(Remember, MirrorSettings.AccessKey, ""), If(Remember, MirrorSettings.SecretKey, ""), mirror:=True)
-                        ElseIf Not Remember Then
-                            Publisher.SaveCredentials("", "", mirror:=True)
-                        End If
                         Dim Result = New PackR2Publisher(Publisher).Publish(Info, Settings, PreviewFiles, Sub(Message) RunInUi(Sub() PublishStatus.Text = Message), MirrorSettings)
                         RunInUi(Sub()
                                     PublishedAddress = Result.SourceAddress

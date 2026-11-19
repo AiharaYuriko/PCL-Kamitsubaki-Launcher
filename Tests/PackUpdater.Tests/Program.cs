@@ -43,6 +43,22 @@ internal static partial class Program {
         };
     static void Main() {
         TestArchiveLinks();
+        Test("publisher credentials can be reopened before publishing and cleared separately", root => {
+            var publisher = new PackPublisher(root);
+            publisher.SaveCredentials("", "");
+            publisher.SaveCredentials("r2-access", "");
+            publisher.SaveCredentials("", "mirror-secret", mirror: true);
+            var reopened = new PackPublisher(root);
+            Assert((string?)reopened.ReadCredentials()["access"] == "r2-access", "R2 edit was lost");
+            Assert((string?)reopened.ReadCredentials(mirror: true)["secret"] == "mirror-secret", "Mirror edit was lost");
+            string unfinished = publisher.ProjectFile("credentials.json") + ".tmp";
+            File.Copy(publisher.ProjectFile("credentials.json"), unfinished);
+            reopened.SaveCredentials("", "");
+            Assert(!File.Exists(unfinished), "Unfinished credential write was not removed");
+            Assert(!publisher.ReadCredentials().HasValues && publisher.ReadCredentials(mirror: true).HasValues, "Credential stores must be independent");
+            reopened.SaveCredentials("", "", mirror: true);
+            Assert(!publisher.ReadCredentials(mirror: true).HasValues, "Mirror credential was not removed");
+        });
         Test("mirror signing preflight requires the configured private bucket", _ => {
             var settings = new PackS3MirrorSettings { Bucket = "custom-pack-bucket" };
             string root = "https://fgws3-ocloud.ihep.ac.cn/";
