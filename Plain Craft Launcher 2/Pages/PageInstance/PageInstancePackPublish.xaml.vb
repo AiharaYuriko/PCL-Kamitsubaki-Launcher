@@ -54,6 +54,8 @@ Public Class PageInstancePackPublish
             PublishSecret.Password = If(CStr(Credentials("secret")), "")
             PublishMirror.Checked = If(CType(Saved("sync_mirror"), Boolean?), True)
             PublishMirrorCredentials.IsEnabled = PublishMirror.Checked
+            PublishMirrorBucket.Text = If(CStr(Saved("mirror_bucket")), PackS3MirrorSettings.DefaultBucket)
+            PublishMirrorRoot.Text = If(CStr(Saved("mirror_root")), PackS3MirrorSettings.DefaultSourceAddress)
             Dim MirrorCredentials = Publisher.ReadCredentials(mirror:=True)
             PublishMirrorAccess.Text = CStr(MirrorCredentials("access"))
             PublishMirrorSecret.Password = If(CStr(MirrorCredentials("secret")), "")
@@ -204,10 +206,12 @@ Public Class PageInstancePackPublish
             .AccessKey = PublishAccess.Text.Trim(), .SecretKey = PublishSecret.Password
         }
         Dim MirrorSettings = If(PublishMirror.Checked AndAlso Not ExportOnly, New PackS3MirrorSettings With {
+            .Bucket = PublishMirrorBucket.Text.Trim(), .SourceAddress = PublishMirrorRoot.Text.Trim(),
             .AccessKey = PublishMirrorAccess.Text.Trim(), .SecretKey = PublishMirrorSecret.Password
         }, Nothing)
         Dim Persist = New JObject From {{"name", Info.Name}, {"id", Info.PackId}, {"channel", Info.Channel}, {"folders", PublishFolders.Text},
-            {"account", Settings.Account}, {"bucket", Settings.Bucket}, {"root", Settings.PublicRoot}, {"sync_mirror", PublishMirror.Checked}}
+            {"account", Settings.Account}, {"bucket", Settings.Bucket}, {"root", Settings.PublicRoot}, {"sync_mirror", PublishMirror.Checked},
+            {"mirror_bucket", PublishMirrorBucket.Text.Trim()}, {"mirror_root", PublishMirrorRoot.Text.Trim()}}
         Dim Remember = PublishRemember.Checked
         SetBusy(True)
         Dim Worker As New RedoableWorker(
@@ -234,7 +238,7 @@ Public Class PageInstancePackPublish
                                     PublishStatus.Text = "R2 发布成功 · " & PublishedAddress
                                     If MirrorSettings IsNot Nothing Then
                                         If Result.MirrorError Is Nothing Then
-                                            PublishStatus.Text &= vbCrLf & "私有 S3 同步成功 · " & PackS3MirrorSettings.SourceAddress
+                                            PublishStatus.Text &= vbCrLf & "私有 S3 同步成功 · " & MirrorSettings.SourceAddress
                                         Else
                                             PublishStatus.Text &= vbCrLf & "私有 S3 同步未完成：" & Result.MirrorError & vbCrLf & "可用同一发布 ID 和相同内容重试。"
                                         End If

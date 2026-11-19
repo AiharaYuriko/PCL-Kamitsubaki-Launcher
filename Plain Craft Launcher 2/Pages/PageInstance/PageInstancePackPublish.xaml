@@ -39,14 +39,28 @@
                         <local:MyTextBox x:Name="PublishAccount" HintText="R2 Account ID" Margin="0,0,6,6" Height="32" />
                         <local:MyTextBox x:Name="PublishBucket" HintText="R2 存储桶名称" Margin="0,0,0,6" Height="32" />
                         <local:MyTextBox x:Name="PublishRoot" HintText="https://下载域名/桶内目录（目录可省略）" Margin="0,0,6,6" Height="32" />
-                        <local:MyTextBox x:Name="PublishAccess" HintText="S3 Access Key ID" Margin="0,0,0,6" Height="32" />
-                        <TextBlock Text="S3 Secret Access Key" VerticalAlignment="Center" />
+                        <local:MyTextBox x:Name="PublishAccess" HintText="R2 Access Key ID" Margin="0,0,0,6" Height="32" />
+                        <TextBlock Text="R2 Secret Access Key" VerticalAlignment="Center" />
                         <PasswordBox x:Name="PublishSecret" Margin="0,0,0,6" Height="32" VerticalContentAlignment="Center" />
                     </UniformGrid>
-                    <local:MyCheckBox x:Name="PublishMirror" Text="发布后同步到旧私有 S3 桶" Margin="0,4,0,6" />
+                    <local:MyCheckBox x:Name="PublishMirror" Text="发布后同步到备用 S3（OSCA）" Margin="0,12,0,6" />
                     <UniformGrid x:Name="PublishMirrorCredentials" Columns="2">
-                        <local:MyTextBox x:Name="PublishMirrorAccess" HintText="备用 S3 Access Key ID" Margin="0,0,6,6" Height="32" />
-                        <PasswordBox x:Name="PublishMirrorSecret" AutomationProperties.Name="备用 S3 Secret Access Key" Margin="0,0,0,6" Height="32" VerticalContentAlignment="Center" />
+                        <StackPanel Margin="0,0,6,6">
+                            <TextBlock Text="备用 S3 存储桶" Margin="0,0,0,4" />
+                            <local:MyTextBox x:Name="PublishMirrorBucket" AutomationProperties.Name="备用 S3 存储桶" Height="32" />
+                        </StackPanel>
+                        <StackPanel Margin="0,0,0,6">
+                            <TextBlock Text="备用签名服务地址" Margin="0,0,0,4" />
+                            <local:MyTextBox x:Name="PublishMirrorRoot" AutomationProperties.Name="备用签名服务地址" Height="32" />
+                        </StackPanel>
+                        <StackPanel Margin="0,0,6,6">
+                            <TextBlock Text="备用 S3 Access Key ID" Margin="0,0,0,4" />
+                            <local:MyTextBox x:Name="PublishMirrorAccess" AutomationProperties.Name="备用 S3 Access Key ID" Height="32" />
+                        </StackPanel>
+                        <StackPanel Margin="0,0,0,6">
+                            <TextBlock Text="备用 S3 Secret Access Key" Margin="0,0,0,4" />
+                            <PasswordBox x:Name="PublishMirrorSecret" AutomationProperties.Name="备用 S3 Secret Access Key" Height="32" VerticalContentAlignment="Center" />
+                        </StackPanel>
                     </UniformGrid>
                     <WrapPanel Margin="0,2,0,8">
                         <local:MyCheckBox x:Name="PublishRemember" Text="为当前 Windows 用户保存凭据" Margin="0,0,14,6" />

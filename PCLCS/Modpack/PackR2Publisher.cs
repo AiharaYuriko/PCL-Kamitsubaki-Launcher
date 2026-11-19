@@ -30,17 +30,32 @@ public sealed class PackR2Settings {
 }
 
 public sealed class PackS3MirrorSettings {
-    public const string SourceAddress = "https://s3-sign.kaf.mom";
+    public const string DefaultSourceAddress = "https://s3-sign.kaf.mom";
+    public const string DefaultBucket = "21045-yrrt-174027";
     internal const string Host = "fgws3-ocloud.ihep.ac.cn";
-    internal const string Bucket = "21045-yrrt-174027";
     internal const string Prefix = "pcl-mirror";
     internal const string Region = "us-east-1";
+    public string Bucket { get; set; } = DefaultBucket;
+    public string SourceAddress { get; set; } = DefaultSourceAddress;
     public string AccessKey { get; set; } = "";
     public string SecretKey { get; set; } = "";
 
     internal void Validate() {
+        if (!Regex.IsMatch(Bucket, @"\A[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]\z") || Bucket.Contains(".."))
+            throw new InvalidDataException("请填写有效的备用 S3 存储桶名称。");
+        PackProtocol.Https(SourceAddress);
+        if (new Uri(SourceAddress).Query.Length != 0)
+            throw new InvalidDataException("备用线路请填写签名服务地址。");
         if (!Regex.IsMatch(AccessKey, @"\A[a-zA-Z0-9]+\z") || string.IsNullOrWhiteSpace(SecretKey))
             throw new InvalidDataException("请填写私有 S3 备用桶的发布凭据。");
+    }
+
+    internal void VerifySigningTarget(Uri? target) {
+        string expectedPath = $"/{Bucket}/{Prefix}/{PackProtocol.IndexPath}";
+        if (target == null || !target.IsAbsoluteUri || target.Scheme != Uri.UriSchemeHttps || target.Host != Host ||
+            !target.IsDefaultPort || target.UserInfo.Length != 0 || target.Fragment.Length != 0 ||
+            target.AbsolutePath != expectedPath || !Regex.IsMatch(target.Query, @"[?&]X-Amz-Signature=[a-f0-9]{64}(?:&|\z)"))
+            throw new IOException("备用签名服务指向的存储桶或目录与发布设置不一致。");
     }
 }
 
@@ -144,7 +159,15 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
 
     private void SyncMirror(S3Objects r2, PackS3MirrorSettings settings, PackPublishDetails details, JObject pointer, byte[] manifest,
         string local, long size, string archiveHash, Action<string> progress) {
-        using var s3 = new S3Objects(PackS3MirrorSettings.Host, PackS3MirrorSettings.Bucket, PackS3MirrorSettings.Prefix,
+        string signedIndex = PackPublisher.PublicUrl(settings.SourceAddress, IndexKey);
+        using (var client = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(15) }) {
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("PCL-Modpack/1.0");
+            using var response = client.GetAsync(signedIndex, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
+            if (response.StatusCode != HttpStatusCode.Found)
+                throw new IOException($"备用签名入口未返回下载跳转（HTTP {(int)response.StatusCode}）。");
+            settings.VerifySigningTarget(response.Headers.Location);
+        }
+        using var s3 = new S3Objects(PackS3MirrorSettings.Host, settings.Bucket, PackS3MirrorSettings.Prefix,
             PackS3MirrorSettings.Region, settings.AccessKey, settings.SecretKey, "备用 S3", false);
         string archiveKey = PackPublisher.ArchiveKey(archiveHash);
         string manifestKey = PackPublisher.ManifestKey(details.PackId, details.Channel, details.ReleaseId);
@@ -153,10 +176,10 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
         s3.PutArchive(archiveKey, local, size, archiveHash, progress);
         s3.PutImmutable(manifestKey, manifest);
         progress("正在验证备用线路的预签名下载……");
-        if (PackProtocol.Hash(PackProtocol.Fetch(PackPublisher.PublicUrl(PackS3MirrorSettings.SourceAddress, manifestKey), ManifestLimit, true)) != manifestHash)
+        if (PackProtocol.Hash(PackProtocol.Fetch(PackPublisher.PublicUrl(settings.SourceAddress, manifestKey), ManifestLimit, true)) != manifestHash)
             throw new IOException("备用线路返回的版本清单与 R2 不一致。");
         using var probe = new MemoryStream();
-        PackProtocol.DownloadRange(PackPublisher.PublicUrl(PackS3MirrorSettings.SourceAddress, archiveKey), probe, 0, 2, size, true, null);
+        PackProtocol.DownloadRange(PackPublisher.PublicUrl(settings.SourceAddress, archiveKey), probe, 0, 2, size, true, null);
         if (!probe.ToArray().SequenceEqual(new byte[] { 0x50, 0x4b })) throw new IOException("备用线路的 ZIP 分段校验失败。");
 
         // OSCA accepts conditional PUT headers without enforcing them. Serialize only the index update through R2.
@@ -176,7 +199,7 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
             byte[] indexBytes = JsonBytes(mirrorIndex);
             if (indexBytes.Length > ManifestLimit) throw new IOException("备用频道目录超过客户端的下载上限。");
             if (previousMirror?.SequenceEqual(indexBytes) != true) s3.PutIndex(IndexKey, indexBytes, null);
-            if (!PackProtocol.Fetch(PackPublisher.PublicUrl(PackS3MirrorSettings.SourceAddress, IndexKey), ManifestLimit, true).SequenceEqual(indexBytes))
+            if (!PackProtocol.Fetch(signedIndex, ManifestLimit, true).SequenceEqual(indexBytes))
                 throw new IOException("预签名入口返回的频道目录与备用桶不同。");
         } finally {
             var locked = r2.Read(MirrorLockKey);

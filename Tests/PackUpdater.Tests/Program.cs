@@ -43,6 +43,15 @@ internal static partial class Program {
         };
     static void Main() {
         TestArchiveLinks();
+        Test("mirror signing preflight requires the configured private bucket", _ => {
+            var settings = new PackS3MirrorSettings { Bucket = "custom-pack-bucket" };
+            string root = "https://fgws3-ocloud.ihep.ac.cn/";
+            string key = "/pcl-mirror/pcl/index.json";
+            string signed = "?X-Amz-Signature=" + new string('a', 64);
+            settings.VerifySigningTarget(new Uri(root + settings.Bucket + key + signed));
+            Throws(() => settings.VerifySigningTarget(new Uri(root + PackS3MirrorSettings.DefaultBucket + key + signed)));
+            Throws(() => settings.VerifySigningTarget(new Uri(root + settings.Bucket + key)));
+        });
         Test("dual publication preserves other channels and rejects a stale mirror release", _ => {
             JObject Pointer(string channel, long sequence, string release) => new() {
                 ["id"] = channel, ["release_id"] = release, ["sequence"] = sequence,
