@@ -69,13 +69,39 @@ public sealed class PackPublisher(string root) {
         PackUpdater.Atomic(path, new JObject { ["encrypted"] = Convert.ToBase64String(encrypted) });
     }
 
-    public List<PackPublishFile> Scan(IEnumerable<string> folders, bool compare = true) {
+    public string GetImportPath(string source) {
+        string instance = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        string full = Path.GetFullPath(source);
+        if (!full.StartsWith(instance, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("请选择当前实例内的文件：" + source);
+        string relative = full.Substring(instance.Length).Replace('\\', '/');
+        ResolveImportFile(relative);
+        return relative;
+    }
+
+    private string ResolveImportFile(string path) {
+        string full = ResolveScanPath(path);
+        if (!File.Exists(full)) throw new IOException("找不到指定文件：" + path);
+        if (path.StartsWith("mods/", StringComparison.OrdinalIgnoreCase) && !PackProtocol.ManagedMod(path))
+            throw new InvalidDataException("mods 目录只支持导入 .jar 或 .jar.disabled 文件：" + path);
+        return full;
+    }
+
+    private string ResolveScanPath(string path) {
+        string top = path.Split('/')[0];
+        if (!DefaultFolders.Contains(top, StringComparer.OrdinalIgnoreCase))
+            throw new InvalidDataException("路径不在可发布的整合包目录内：" + path);
+        return PackProtocol.Safe(root, path);
+    }
+
+    public List<PackPublishFile> Scan(IEnumerable<string> folders, bool compare = true, IEnumerable<string>? files = null) {
         var result = new Dictionary<string, PackPublishFile>(StringComparer.OrdinalIgnoreCase);
+        foreach (string file in files ?? Enumerable.Empty<string>()) {
+            string path = file.Replace('\\', '/');
+            Add(path, ResolveImportFile(path));
+        }
         foreach (string folder in folders.Select(f => f.Trim().Replace('\\', '/').TrimEnd('/')).Where(f => f.Length != 0).Distinct(StringComparer.OrdinalIgnoreCase)) {
-            string top = folder.Split('/')[0];
-            if (!DefaultFolders.Contains(top, StringComparer.OrdinalIgnoreCase))
-                throw new InvalidDataException("请选择允许发布的整合包目录：" + folder);
-            string full = PackProtocol.Safe(root, folder);
+            string full = ResolveScanPath(folder);
             if (File.Exists(full)) Add(folder, full);
             else if (Directory.Exists(full)) Walk(full, folder, Add);
         }

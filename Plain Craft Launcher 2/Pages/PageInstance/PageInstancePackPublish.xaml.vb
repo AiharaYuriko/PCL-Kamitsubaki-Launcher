@@ -25,6 +25,7 @@ Public Class PageInstancePackPublish
         Publisher = New PackPublisher(Target.PathVersion)
         PublishOperations.ItemsSource = PackPublisher.Operations
         AddHandler PublishScan.Click, Async Sub() Await ScanPublisher()
+        AddHandler PublishImportFiles.Click, Async Sub() Await ImportPublisherFiles()
         AddHandler PublishBaseline.Click, Async Sub() Await RecordBaseline()
         AddHandler PublishMaps.Click, Async Sub() Await ImportPublisherMap()
         AddHandler PublishWaypoints.Click, Async Sub() Await ImportPublisherWaypoints()
@@ -33,18 +34,15 @@ Public Class PageInstancePackPublish
         AddHandler PublishExport.Click, Sub() SubmitPublication(True)
         AddHandler PublishCopy.Click, Sub() Clipboard.SetText(PublishedAddress)
         AddHandler PublishMirror.Change, Sub() PublishMirrorCredentials.IsEnabled = PublishMirror.Checked
-        AddHandler PublishFolders.TextChanged,
-            Sub()
-                DraftFiles = Nothing
-                PublishFiles.ItemsSource = Nothing
-                UpdatePublisherControls()
-            End Sub
+        AddHandler PublishFolders.TextChanged, Sub() InvalidateDraft()
+        AddHandler PublishFilePaths.TextChanged, Sub() InvalidateDraft()
         Try
             Dim Saved = Publisher.Settings
             PackName.Text = If(CStr(Saved("name")), Target.Name)
             PackId.Text = CStr(Saved("id"))
             PublishChannel.Text = If(CStr(Saved("channel")), "stable")
             PublishFolders.Text = If(CStr(Saved("folders")), String.Join("; ", PackPublisher.DefaultFolders))
+            PublishFilePaths.Text = If(CStr(Saved("files")), "")
             PublishAccount.Text = CStr(Saved("account"))
             PublishBucket.Text = CStr(Saved("bucket"))
             Dim SavedRoot = CStr(Saved("root"))
@@ -65,7 +63,7 @@ Public Class PageInstancePackPublish
             If Not String.IsNullOrEmpty(PublishedAddress) Then
                 PublishStatus.Text = "最近发布 " & CStr(Latest("release")("id")) & " · " & PublishedAddress
             Else
-                PublishStatus.Text = If(Publisher.HasBaseline, "已保存旧整合包基线。", "先扫描原始实例，再保存基线。")
+                PublishStatus.Text = If(Publisher.HasBaseline, "已保存旧整合包基线。", "请扫描原始实例或导入指定文件，再保存基线。")
             End If
         Catch ex As Exception
             PublishStatus.Text = "加载发布项目失败：" & ex.Message
@@ -87,20 +85,41 @@ Public Class PageInstancePackPublish
         PublishCopy.IsEnabled = Not Busy AndAlso Not String.IsNullOrEmpty(PublishedAddress)
     End Sub
 
-    Private Function PublisherFolders() As String()
-        Return PublishFolders.Text.Split({ChrW(13), ChrW(10), ";"c}, StringSplitOptions.RemoveEmptyEntries)
+    Private Sub InvalidateDraft()
+        DraftFiles = Nothing
+        PublishFiles.ItemsSource = Nothing
+        UpdatePublisherControls()
+    End Sub
+
+    Private Function SelectedFilePaths() As String()
+        Return PublishFilePaths.Text.Split({ChrW(13), ChrW(10)}, StringSplitOptions.RemoveEmptyEntries)
+    End Function
+
+    Private Async Function ImportPublisherFiles() As Task
+        If Busy Then Return
+        Dim Selected = Dialogs.SelectFile("选择当前实例内要导入的文件", True, Target.PathVersion)
+        If Selected.Count = 0 Then Return
+        Try
+            Dim Paths = SelectedFilePaths().Concat(Selected.Select(Function(File) Publisher.GetImportPath(File)))
+            PublishFilePaths.Text = String.Join(vbCrLf, Paths.Distinct(StringComparer.OrdinalIgnoreCase))
+        Catch ex As Exception
+            PublishStatus.Text = ex.Message
+            Return
+        End Try
+        Await ScanPublisher()
     End Function
 
     Private Async Function ScanPublisher() As Task
         If Busy Then Return
-        Dim Folders = PublisherFolders()
+        Dim Folders = PublishFolders.Text.Split({ChrW(13), ChrW(10), ";"c}, StringSplitOptions.RemoveEmptyEntries)
+        Dim Selected = SelectedFilePaths()
         SetBusy(True)
         PublishStatus.Text = "正在扫描客户端文件并匹配平台版本……"
         Try
             DraftFiles = Await Task.Run(
                 Function()
                     ModPackUpdate.CheckIdle(Target)
-                    Dim Files = Publisher.Scan(Folders)
+                    Dim Files = Publisher.Scan(Folders, files:=Selected)
                     If Publisher.HasBaseline Then ResolveModSources(Files)
                     Return Files
                 End Function)
@@ -108,6 +127,9 @@ Public Class PageInstancePackPublish
             PublishStatus.Text = If(Publisher.HasBaseline,
                 $"扫描完成，共 {DraftFiles.Count} 项。请选择发布策略和可公开分发的 ZIP 备用 Mod。",
                 $"找到 {DraftFiles.Count} 项基线候选。确认这是玩家共用的旧包后，点击保存旧包基线。")
+            If DraftFiles.Any(Function(f) f.Change = "已移出") Then
+                PublishStatus.Text &= vbCrLf & "此次发布使用完整文件清单。「已移出」的旧受管文件可能在玩家更新时清理。"
+            End If
         Catch ex As Exception
             DraftFiles = Nothing
             PublishFiles.ItemsSource = Nothing
@@ -131,7 +153,7 @@ Public Class PageInstancePackPublish
                            End Sub)
             DraftFiles = Nothing
             PublishFiles.ItemsSource = Nothing
-            PublishStatus.Text = "旧包基线已保存。调整此实例后重新扫描并预览即可发布。"
+            PublishStatus.Text = "旧包基线已保存。调整此实例后可重新扫描或导入指定文件。"
         Catch ex As Exception
             PublishStatus.Text = ex.Message
         Finally
@@ -191,10 +213,12 @@ Public Class PageInstancePackPublish
         If ExportOnly Then
             Output = Dialogs.SaveFile("选择测试整合包保存路径", "pcl-test-pack.zip", filter:={("zip", "整合包 ZIP")})
             If String.IsNullOrEmpty(Output) Then Return
-        ElseIf MyMsgBox(If(PublishMirror.Checked, "发布到 R2 后自动同步私有 S3，并验证备用签名入口。是否继续？",
-                       "上传完整 ZIP 与清单并切换正式频道？切换成功后，绑定此频道的玩家将看到本版本。"),
-                       "发布整合包", "发布", "取消") <> 1 Then
-            Return
+        Else
+            Dim Message = If(PublishMirror.Checked, "发布到 R2 后自动同步私有 S3，并验证备用签名入口。",
+                             "上传完整 ZIP 与清单并切换正式频道。")
+            Dim RemovedCount = DraftFiles.Where(Function(f) f.Change = "已移出").Count()
+            If RemovedCount > 0 Then Message &= vbCrLf & $"预览中有 {RemovedCount} 项「已移出」。玩家更新时可能清理这些旧受管文件。"
+            If MyMsgBox(Message, "发布整合包", "发布", "取消") <> 1 Then Return
         End If
         Dim PreviewFiles = DraftFiles
         Dim Info As New PackPublishDetails With {
@@ -209,7 +233,7 @@ Public Class PageInstancePackPublish
             .Bucket = PublishMirrorBucket.Text.Trim(), .SourceAddress = PublishMirrorRoot.Text.Trim(),
             .AccessKey = PublishMirrorAccess.Text.Trim(), .SecretKey = PublishMirrorSecret.Password
         }, Nothing)
-        Dim Persist = New JObject From {{"name", Info.Name}, {"id", Info.PackId}, {"channel", Info.Channel}, {"folders", PublishFolders.Text},
+        Dim Persist = New JObject From {{"name", Info.Name}, {"id", Info.PackId}, {"channel", Info.Channel}, {"folders", PublishFolders.Text}, {"files", PublishFilePaths.Text},
             {"account", Settings.Account}, {"bucket", Settings.Bucket}, {"root", Settings.PublicRoot}, {"sync_mirror", PublishMirror.Checked},
             {"mirror_bucket", PublishMirrorBucket.Text.Trim()}, {"mirror_root", PublishMirrorRoot.Text.Trim()}}
         Dim Remember = PublishRemember.Checked

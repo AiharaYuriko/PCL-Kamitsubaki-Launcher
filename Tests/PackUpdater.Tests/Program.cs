@@ -292,6 +292,29 @@ internal static partial class Program {
             updater.Apply(updater.Plan(removed, Array.Empty<string>()), () => new PackRuntime(), _ => { }, options: range);
             Assert(JToken.DeepEquals(JObject.Parse(System.IO.File.ReadAllText(settingsPath)), merged), "Cleanup deleted patched player config");
         });
+        Test("explicit files can build a baseline and a release without scanning siblings", root => {
+            string author = Path.Combine(root, "author");
+            var publisher = new PackPublisher(author);
+            const string selected = "config/sub/rules;main.toml";
+            const string sibling = "config/sub/local.toml";
+            Write(author, selected, "old");
+            Write(author, sibling, "local");
+            Write(root, "config/outside.toml", "outside");
+            Assert(publisher.GetImportPath(Path.Combine(author, selected)) == selected, "Selection must preserve its instance path");
+            Throws(() => publisher.GetImportPath(Path.Combine(root, "config/outside.toml")));
+            Throws(() => publisher.Scan(Array.Empty<string>(), files: new[] { "config/missing.toml" }));
+            var baseline = publisher.Scan(Array.Empty<string>(), files: new[] { selected, selected });
+            Assert(baseline.Single().Path == selected, "Selection included siblings or duplicates");
+            publisher.SaveBaseline(baseline);
+
+            Write(author, selected, "updated");
+            var draft = publisher.Scan(Array.Empty<string>(), files: new[] { selected });
+            Assert(draft.Single().Change == "更新", "Selected file was not compared with its baseline");
+            Assert(publisher.Scan(new[] { "config" }, files: new[] { selected }).Count == 2, "Overlapping scan and selection duplicated a file");
+            var release = publisher.Build(Details(), draft, 1, Path.Combine(root, "selected.zip"), "https://example.com");
+            Assert((string?)release["baseline"]!.Single()["path"] == selected &&
+                (string?)release["files"]!.Single()["path"] == selected, "Selection did not reach the release");
+        });
         Test("renamed mod is previewed together and only a verified duplicate is removed", root => {
             string author = Path.Combine(root, "author"), player = Path.Combine(root, "player");
             Write(author, "mods/a-1.jar", "old");

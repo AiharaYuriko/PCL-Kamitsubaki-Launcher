@@ -6,7 +6,7 @@
         <StackPanel Margin="25,10">
             <local:MyCard x:Name="PublishCard" Title="整合包发布" Margin="0,15,0,15">
                 <StackPanel Margin="25,40,25,20">
-                    <TextBlock Text="请先用原始客户端整合包建立基线，再修改此实例。扫描后可逐项选择强制操作和 ZIP 备用文件。" TextWrapping="Wrap" Margin="0,0,0,10" />
+                    <TextBlock Text="请先用原始客户端整合包建立基线，再修改此实例。可以扫描目录，也可以导入指定文件；只用指定文件时请清空扫描目录。" TextWrapping="Wrap" Margin="0,0,0,10" />
                     <UniformGrid Columns="2">
                         <local:MyTextBox x:Name="PackName" HintText="整合包显示名称" Margin="0,0,6,6" Height="32" />
                         <local:MyTextBox x:Name="PackId" HintText="整合包 ID（例 kamitsubaki-city）" Margin="0,0,0,6" Height="32" />
@@ -14,9 +14,11 @@
                         <local:MyTextBox x:Name="PublishChannel" HintText="频道（默认 stable）" Margin="0,0,0,6" Height="32" />
                     </UniformGrid>
                     <local:MyTextBox x:Name="PublishNotes" HintText="发布说明" Margin="0,0,0,6" MinHeight="32" AcceptsReturn="True" TextWrapping="Wrap" />
-                    <local:MyTextBox x:Name="PublishFolders" HintText="扫描路径，每行一个或用分号分隔" Margin="0,0,0,6" MinHeight="45" AcceptsReturn="True" TextWrapping="Wrap" />
+                    <local:MyTextBox x:Name="PublishFolders" HintText="扫描目录，每行一个或用分号分隔" Margin="0,0,0,6" MinHeight="45" AcceptsReturn="True" TextWrapping="Wrap" />
+                    <local:MyTextBox x:Name="PublishFilePaths" HintText="指定文件（实例内相对路径，每行一个）" Margin="0,0,0,6" MinHeight="32" MaxHeight="100" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
                     <WrapPanel Margin="0,4,0,8">
                         <local:MyButton x:Name="PublishScan" Text="扫描并预览" Height="34" MinWidth="110" Margin="0,0,8,4" />
+                        <local:MyButton x:Name="PublishImportFiles" Text="导入指定文件" Height="34" MinWidth="110" Margin="0,0,8,4" />
                         <local:MyButton x:Name="PublishBaseline" Text="保存旧包基线" Height="34" MinWidth="110" Margin="0,0,8,4" />
                         <local:MyButton x:Name="PublishMaps" Text="导入 Xaero 地图" Height="34" MinWidth="125" Margin="0,0,8,4" />
                         <local:MyButton x:Name="PublishWaypoints" Text="导入 Xaero 航点" Height="34" MinWidth="125" Margin="0,0,8,4" />
