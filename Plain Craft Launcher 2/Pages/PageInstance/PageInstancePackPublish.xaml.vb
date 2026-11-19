@@ -33,7 +33,6 @@ Public Class PageInstancePackPublish
         AddHandler PublishNow.Click, Sub() SubmitPublication(False)
         AddHandler PublishExport.Click, Sub() SubmitPublication(True)
         AddHandler PublishCopy.Click, Sub() Clipboard.SetText(PublishedAddress)
-        AddHandler PublishMirror.Change, Sub() PublishMirrorCredentials.IsEnabled = PublishMirror.Checked
         AddHandler PublishFolders.TextChanged, Sub() InvalidateDraft()
         AddHandler PublishFilePaths.TextChanged, Sub() InvalidateDraft()
         Try
@@ -68,12 +67,40 @@ Public Class PageInstancePackPublish
         Catch ex As Exception
             PublishStatus.Text = "加载发布项目失败：" & ex.Message
         End Try
+        AddHandler PublishAccount.TextChanged, Sub() SaveStorageSettings()
+        AddHandler PublishBucket.TextChanged, Sub() SaveStorageSettings()
+        AddHandler PublishRoot.TextChanged, Sub() SaveStorageSettings()
+        AddHandler PublishMirrorBucket.TextChanged, Sub() SaveStorageSettings()
+        AddHandler PublishMirrorRoot.TextChanged, Sub() SaveStorageSettings()
+        AddHandler PublishMirror.Change, Sub()
+                                             PublishMirrorCredentials.IsEnabled = PublishMirror.Checked
+                                             SaveStorageSettings()
+                                         End Sub
         AddHandler PublishRemember.Change, Sub() SaveRememberChoice()
         AddHandler PublishAccess.TextChanged, Sub() SaveEditedCredentials(False)
         AddHandler PublishSecret.PasswordChanged, Sub() SaveEditedCredentials(False)
         AddHandler PublishMirrorAccess.TextChanged, Sub() SaveEditedCredentials(True)
         AddHandler PublishMirrorSecret.PasswordChanged, Sub() SaveEditedCredentials(True)
         UpdatePublisherControls()
+    End Sub
+
+    Private Sub SaveStorageSettings()
+        Try
+            Dim Saved = Publisher.Settings
+            CaptureStorageSettings(Saved)
+            Publisher.SaveSettings(Saved)
+        Catch ex As Exception
+            PublishStatus.Text = "无法保存存储桶设置：" & ex.Message
+        End Try
+    End Sub
+
+    Private Sub CaptureStorageSettings(Saved As JObject)
+        Saved("account") = PublishAccount.Text.Trim()
+        Saved("bucket") = PublishBucket.Text.Trim()
+        Saved("root") = PublishRoot.Text.Trim()
+        Saved("sync_mirror") = PublishMirror.Checked
+        Saved("mirror_bucket") = PublishMirrorBucket.Text.Trim()
+        Saved("mirror_root") = PublishMirrorRoot.Text.Trim()
     End Sub
 
     Private Sub SaveRememberChoice()
@@ -269,10 +296,9 @@ Public Class PageInstancePackPublish
             .Bucket = PublishMirrorBucket.Text.Trim(), .SourceAddress = PublishMirrorRoot.Text.Trim(),
             .AccessKey = PublishMirrorAccess.Text.Trim(), .SecretKey = PublishMirrorSecret.Password
         }, Nothing)
-        Dim Persist = New JObject From {{"name", Info.Name}, {"id", Info.PackId}, {"channel", Info.Channel}, {"folders", PublishFolders.Text}, {"files", PublishFilePaths.Text},
-            {"account", Settings.Account}, {"bucket", Settings.Bucket}, {"root", Settings.PublicRoot}, {"sync_mirror", PublishMirror.Checked},
-            {"mirror_bucket", PublishMirrorBucket.Text.Trim()}, {"mirror_root", PublishMirrorRoot.Text.Trim()},
-            {"remember_credentials", PublishRemember.Checked}}
+        Dim Persist = New JObject From {{"name", Info.Name}, {"id", Info.PackId}, {"channel", Info.Channel}, {"folders", PublishFolders.Text},
+            {"files", PublishFilePaths.Text}, {"remember_credentials", PublishRemember.Checked}}
+        CaptureStorageSettings(Persist)
         SetBusy(True)
         Dim Worker As New RedoableWorker(
             Sub()
