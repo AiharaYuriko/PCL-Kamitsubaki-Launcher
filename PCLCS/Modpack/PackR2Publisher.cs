@@ -30,7 +30,7 @@ public sealed class PackR2Settings {
 }
 
 public sealed class PackS3MirrorSettings {
-    public const string DefaultSourceAddress = "https://s3-sign.kaf.mom";
+    public const string DefaultSourceAddress = PackMirror.DefaultAddress;
     public const string DefaultBucket = "21045-yrrt-174027";
     internal const string Host = "fgws3-ocloud.ihep.ac.cn";
     internal const string Prefix = "pcl-mirror";

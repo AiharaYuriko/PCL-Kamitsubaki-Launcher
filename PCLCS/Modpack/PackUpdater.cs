@@ -70,10 +70,8 @@ public sealed partial class PackUpdater {
         PackProtocol.Https(source);
         if (State["pack_id"] != null && ((string?)State["pack_id"] != pack || (string?)State["channel"] != channel)) throw new InvalidOperationException("此实例已有其他整合包或频道的更新记录，请使用独立实例。");
         var binding = new JObject { ["source"] = source, ["index_url"] = ResolveIndexAddress(source), ["pack_id"] = pack, ["channel"] = channel };
-        if (mirror != null) {
-            binding["mirror_url"] = mirror.Address;
-            binding["prefer_mirror"] = mirror.PreferMirror;
-        }
+        binding["mirror_url"] = mirror?.Address ?? "";
+        if (mirror != null) binding["prefer_mirror"] = mirror.PreferMirror;
         Atomic(Work("binding.json"), binding);
     }
     public static JObject GetIndex(string source, PackMirror? mirror = null) {

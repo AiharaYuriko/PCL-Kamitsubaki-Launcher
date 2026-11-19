@@ -43,6 +43,19 @@ internal static partial class Program {
         };
     static void Main() {
         TestArchiveLinks();
+        Test("official update source has its own default mirror and explicit disable is saved", root => {
+            foreach (string source in new[] { "https://r2.kaf.mom", "https://R2.KAF.MOM/", "https://r2.kaf.mom/pcl/index.json" })
+                Assert(PackMirror.DefaultAddressFor(source) == PackMirror.DefaultAddress, "Official source should have the official mirror");
+            foreach (string source in new[] { "https://other.example", "https://r2.kaf.mom/custom", "https://r2.kaf.mom/pcl/index.json?foo=bar",
+                         "https://user@r2.kaf.mom", "http://r2.kaf.mom", "https://r2.kaf.mom:444", "" })
+                Assert(PackMirror.DefaultAddressFor(source) == "", "Custom sources should not get an unrelated mirror");
+            var updater = new PackUpdater(root);
+            var mirror = new PackMirror(PackMirror.DefaultAddress);
+            Assert(!mirror.PreferMirror, "The primary source should still come first by default");
+            updater.Bind(PackMirror.DefaultPrimaryAddress, "test", "stable", mirror);
+            updater.Bind(PackMirror.DefaultPrimaryAddress, "test", "stable");
+            Assert((string?)new PackUpdater(root).Binding["mirror_url"] == "", "Clearing the mirror should survive reopening");
+        });
         Test("publisher credentials can be reopened before publishing and cleared separately", root => {
             var publisher = new PackPublisher(root);
             publisher.SaveCredentials("", "");

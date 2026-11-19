@@ -5,11 +5,20 @@ namespace PCL.Modpack;
 
 /// <summary>Routes published objects through an optional HTTPS presigning service.</summary>
 public sealed class PackMirror {
+    public const string DefaultPrimaryAddress = "https://r2.kaf.mom";
+    public const string DefaultAddress = "https://s3-sign.kaf.mom";
     private readonly string root;
     private bool useMirror;
 
     public string Address => root;
     public bool PreferMirror { get; }
+
+    public static string DefaultAddressFor(string source) {
+        if (!Uri.TryCreate(source.Trim(), UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps ||
+            !uri.IsDefaultPort || uri.UserInfo.Length != 0 || uri.GetLeftPart(UriPartial.Authority) != DefaultPrimaryAddress ||
+            uri.Query.Length != 0 || uri.Fragment.Length != 0) return "";
+        return uri.AbsolutePath == "/" || uri.AbsolutePath == "/" + PackProtocol.IndexPath ? DefaultAddress : "";
+    }
 
     public PackMirror(string address, bool preferMirror = false) {
         PackProtocol.Https(address);

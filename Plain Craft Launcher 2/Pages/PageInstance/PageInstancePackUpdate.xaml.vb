@@ -13,6 +13,8 @@ Public Class PageInstancePackUpdate
     Private Busy As Boolean
     Private LoadingComponents As Boolean
     Private Started As Boolean
+    Private FollowDefaultMirror As Boolean
+    Private FillingDefaultMirror As Boolean
     Public ReadOnly Property InstancePath As String
         Get
             Return Target.PathVersion
@@ -26,7 +28,10 @@ Public Class PageInstancePackUpdate
         Dim Binding = Updater.Binding
         Dim SavedSource = CStr(Binding("source"))
         Source.Text = If(String.IsNullOrWhiteSpace(SavedSource), ModPackUpdate.DefaultPackSource, SavedSource)
-        MirrorSource.Text = If(CStr(Binding("mirror_url")), "")
+        Dim DefaultMirror = PackMirror.DefaultAddressFor(Source.Text)
+        Dim SavedMirror = CStr(Binding("mirror_url"))
+        FollowDefaultMirror = SavedMirror Is Nothing OrElse (DefaultMirror.Length > 0 AndAlso SavedMirror = DefaultMirror)
+        MirrorSource.Text = If(SavedMirror, DefaultMirror)
         PreferMirror.Checked = CBool(If(Binding("prefer_mirror"), New JValue(False)))
         PreferMirror.IsEnabled = Not String.IsNullOrWhiteSpace(MirrorSource.Text)
         Status.Text = "可以直接读取默认更新源，也可以输入服主提供的地址。"
@@ -39,10 +44,23 @@ Public Class PageInstancePackUpdate
         AddHandler Choices.SelectionChanged, Sub()
                                                  Release = Nothing : Preview = Nothing : Components.Children.Clear() : Details.Children.Clear() : Update.IsEnabled = False
                                              End Sub
-        AddHandler Source.TextChanged, Sub() InvalidateSource()
+        AddHandler Source.TextChanged, Sub()
+                                          If FollowDefaultMirror Then
+                                              FillingDefaultMirror = True
+                                              Try
+                                                  MirrorSource.Text = PackMirror.DefaultAddressFor(Source.Text)
+                                              Finally
+                                                  FillingDefaultMirror = False
+                                              End Try
+                                          End If
+                                          InvalidateSource()
+                                      End Sub
         AddHandler MirrorSource.TextChanged, Sub()
                                                 PreferMirror.IsEnabled = Not String.IsNullOrWhiteSpace(MirrorSource.Text)
-                                                InvalidateSource()
+                                                If Not FillingDefaultMirror Then
+                                                    FollowDefaultMirror = False
+                                                    InvalidateSource()
+                                                End If
                                             End Sub
         AddHandler PreferMirror.Change, Sub() InvalidateSource()
         AddHandler Loaded, Async Sub()

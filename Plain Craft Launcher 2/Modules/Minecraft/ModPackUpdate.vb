@@ -1,7 +1,7 @@
 Imports PCL.Modpack
 
 Public Module ModPackUpdate
-    Public Const DefaultPackSource As String = "https://r2.kaf.mom"
+    Public Const DefaultPackSource As String = PackMirror.DefaultPrimaryAddress
 
     Public Sub CheckIdle(Instance As McInstance)
         If McLaunchLoader.State = LoadState.Loading OrElse HasRunningMinecraft Then Throw New Exception("请先关闭正在运行的游戏，再更新整合包。")
