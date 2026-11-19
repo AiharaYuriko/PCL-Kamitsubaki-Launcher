@@ -13,7 +13,7 @@ Public Class MyLocalModItem
         End Get
         Set(value As String)
             Dim RawValue = value
-            LabTitle.TextDecorations = If(Entry.IsEnabled, Nothing, TextDecorations.Strikethrough)
+            LabTitle.TextDecorations = If(Entry IsNot Nothing AndAlso Not Entry.IsEnabled, TextDecorations.Strikethrough, Nothing)
             If LabTitle.Text = value Then Return
             LabTitle.Text = value
             _Title = RawValue
@@ -87,7 +87,7 @@ Public Class MyLocalModItem
     '鼠标点击判定
     Private IsMouseDown As Boolean = False
     Private Sub Button_MouseDown(sender As Object, e As MouseButtonEventArgs) Handles Me.PreviewMouseLeftButtonDown
-        If Not IsMouseDirectlyOver Then Return
+        If Entry Is Nothing OrElse Not IsMouseDirectlyOver Then Return
         IsMouseDown = True
         If ButtonStack IsNot Nothing Then ButtonStack.IsHitTestVisible = False
     End Sub
@@ -110,7 +110,7 @@ Public Class MyLocalModItem
     End Property
     Private Shared SwipToState As Boolean '被滑动到的目标应将 Checked 改为此值
     Private Sub Button_MouseSwipeStart(sender As Object, e As Object) Handles Me.MouseLeftButtonDown
-        If Parent Is Nothing Then Return 'Mod 可能已被删除（#3824）
+        If Entry Is Nothing OrElse Parent Is Nothing Then Return 'Mod 可能已被删除（#3824）
         '开始滑动
         Dim Index = CType(Parent, StackPanel).Children.IndexOf(Me)
         SwipeStart = Index
@@ -119,7 +119,7 @@ Public Class MyLocalModItem
         SwipToState = Not Checked
     End Sub
     Private Sub Button_MouseSwipe(sender As Object, e As Object) Handles Me.MouseEnter, Me.MouseLeave, Me.MouseLeftButtonUp
-        If Parent Is Nothing Then Return 'Mod 可能已被删除（#3824）
+        If Entry Is Nothing OrElse Parent Is Nothing Then Return 'Mod 可能已被删除（#3824）
         '结束滑动
         If Mouse.LeftButton <> MouseButtonState.Pressed OrElse
            TypeOf Mouse.DirectlyOver IsNot MyLocalModItem Then '#5771
@@ -319,6 +319,14 @@ Public Class MyLocalModItem
     Public Sub New()
         InitializeComponent()
         LazyLoadBehavior.OnFirstEnterScrollViewerViewport(Me, AddressOf FirstEnterScrollViewerViewport)
+    End Sub
+    Friend Sub New(Name As String, Status As String, Details As String, Logo As String)
+        InitializeComponent()
+        Title = Name
+        SubTitle = "  |  " & Status
+        Description = Details
+        LabTitle.SetResourceReference(TextBlock.ForegroundProperty, "ColorBrush1")
+        PathLogo.Source = If(String.IsNullOrEmpty(Logo), PathImage & "Icons/NoIcon.png", Logo)
     End Sub
     Private HasEnteredViewport As Boolean = False
     Private Sub FirstEnterScrollViewerViewport()

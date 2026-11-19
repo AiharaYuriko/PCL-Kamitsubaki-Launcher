@@ -12,6 +12,7 @@ public sealed class PackChange {
     public string Reason { get; set; } = "";
     public string? Before { get; set; }
     public JObject? File { get; set; }
+    public bool IsMod => PackProtocol.ManagedMod(Path);
     internal string? DependsOn { get; set; }
     internal string? ToggleDestination => Kind switch {
         "禁用" => Path + ".disabled",
@@ -31,6 +32,18 @@ public sealed class PackPlan {
     internal Dictionary<string, string> FileTargets { get; } = new(StringComparer.OrdinalIgnoreCase);
     public bool IsApplied => (string?)Release["schema"] == PackProtocol.ArchiveRelease && (long?)State["sequence"] == (long?)Release["release"]?["sequence"];
     public long Bytes => Changes.Where(c => c.File != null).Sum(c => (long)c.File!["size"]!);
+
+    public IEnumerable<(PackChange Change, string[] PreviousPaths)> PreviewChanges() {
+        var replacements = new HashSet<string>(
+            Changes.Where(c => c.File != null && c.IsMod).Select(c => c.Path),
+            StringComparer.OrdinalIgnoreCase);
+        var oldVersions = Changes.Where(c => c.Kind == "删除旧版本" && c.DependsOn != null && replacements.Contains(c.DependsOn))
+            .ToLookup(c => c.DependsOn!, StringComparer.OrdinalIgnoreCase);
+        foreach (var change in Changes) {
+            if (change.DependsOn != null && oldVersions[change.DependsOn].Contains(change)) continue;
+            yield return (change, oldVersions[change.Path].Select(c => c.Path).ToArray());
+        }
+    }
 }
 public sealed class PackRuntime {
     public List<string> Paths { get; } = new();

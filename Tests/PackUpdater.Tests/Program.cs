@@ -292,7 +292,7 @@ internal static partial class Program {
             updater.Apply(updater.Plan(removed, Array.Empty<string>()), () => new PackRuntime(), _ => { }, options: range);
             Assert(JToken.DeepEquals(JObject.Parse(System.IO.File.ReadAllText(settingsPath)), merged), "Cleanup deleted patched player config");
         });
-        Test("preinstalled renamed mod removes only verified old copy", root => {
+        Test("renamed mod is previewed together and only a verified duplicate is removed", root => {
             string author = Path.Combine(root, "author"), player = Path.Combine(root, "player");
             Write(author, "mods/a-1.jar", "old");
             var publisher = new PackPublisher(author);
@@ -307,12 +307,18 @@ internal static partial class Program {
             newer.EmbedMod = true;
             var release = publisher.Build(Details(), files, 1, Path.Combine(root, "pack.zip"), "https://example.com");
             var updater = new PackUpdater(player);
+            Write(player, "mods/a-1.jar", "old");
+            var upgrade = updater.Plan(release, Array.Empty<string>());
+            var preview = upgrade.PreviewChanges().Single();
+            Assert(upgrade.Changes.Count == 2 && preview.Change.Path == "mods/a-2.jar" &&
+                preview.PreviousPaths.SequenceEqual(new[] { "mods/a-1.jar" }), "Renamed upgrade should be previewed as one Mod row");
             Write(player, "mods/a-2.jar", "new");
             Write(player, "mods/a-1.jar", "player");
             Throws(() => updater.Plan(release, Array.Empty<string>()));
             Write(player, "mods/a-1.jar", "old");
             var plan = updater.Plan(release, Array.Empty<string>());
             Assert(plan.Changes.Single().Path == "mods/a-1.jar" && plan.Bytes == 0, "Incorrect duplicate cleanup preview");
+            Assert(plan.PreviewChanges().Single().Change.Kind == "删除旧版本", "Standalone duplicate cleanup should remain visible");
             updater.Apply(plan, () => new PackRuntime(), _ => { });
             Assert(!System.IO.File.Exists(Path.Combine(player, "mods/a-1.jar")) && System.IO.File.ReadAllText(Path.Combine(player, "mods/a-2.jar")) == "new", "Duplicate mod survived");
         });

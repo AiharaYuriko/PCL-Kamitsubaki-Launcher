@@ -131,7 +131,19 @@ Public Class PageInstancePackUpdate
             Preview = Await Task.Run(Function() Updater.Plan(Release, Selected))
             Dim RuntimeMessage = If(Preview.IsApplied, "此版本已应用。", Await Task.Run(Function() ModPackUpdate.CheckRuntime(Target, Release)))
             Details.Children.Clear()
-            For Each Change In Preview.Changes
+            Dim Rows = Preview.PreviewChanges().ToList()
+            For Each Row In Rows
+                Dim Change = Row.Change
+                If Change.IsMod Then
+                    Dim Name = If(Change.Name.StartsWith("mods/", StringComparison.OrdinalIgnoreCase),
+                        If(CStr(Change.File?("id")), System.IO.Path.GetFileName(Change.Path)), Change.Name)
+                    Dim Kind = If(Row.PreviousPaths.Length > 0 AndAlso Change.Kind = "新增", "更新", Change.Kind)
+                    Dim Paths = String.Join("、", Row.PreviousPaths)
+                    Dim Info = If(Paths = "", Change.Path, Paths & " → " & Change.Path)
+                    If Change.Reason <> "" Then Info &= " · " & Change.Reason
+                    Details.Children.Add(New MyLocalModItem(Name, Kind, Info, Change.Icon) With {.ToolTip = Kind & " · " & Name & vbCrLf & Info})
+                    Continue For
+                End If
                 Dim Item As New MyListItem With {.Title = Change.Kind & " · " & Change.Name, .Info = Change.Path & If(Change.Reason = "", "", " · " & Change.Reason), .Height = 62,
                     .Logo = If(Change.Icon = "", "pack://application:,,,/images/Blocks/NeoForge.png", Change.Icon)}
                 Details.Children.Add(Item)
@@ -142,7 +154,7 @@ Public Class PageInstancePackUpdate
             Dim Installed = If(CStr(Updater.State("release_id")), "未绑定")
             Dim Archived = CStr(Release("schema")) = PackProtocol.ArchiveRelease
             Status.Text = Installed & " → " & CStr(Release("release")("id")) & vbCrLf & RuntimeMessage & vbCrLf &
-                $"{Preview.Changes.Count} 项文件变化，{If(Archived, "待获取文件总大小", "下载")} {Preview.Bytes / 1024 / 1024:F1} MB。" & vbCrLf & CStr(Release("release")("notes"))
+                $"{Rows.Count} 项变动，{If(Archived, "待获取文件总大小", "下载")} {Preview.Bytes / 1024 / 1024:F1} MB。" & vbCrLf & CStr(Release("release")("notes"))
             If Preview.BaselineMatches.HasValue Then
                 Dim ExpectedName = If(CStr(Release("baseline_instance")), "旧整合包")
                 Status.Text &= vbCrLf & $"首次接入 · 基线实例 {ExpectedName} · 已匹配 {Preview.BaselineMatches.Value}/{CType(Release("baseline"), JArray).Count} 项文件。"
