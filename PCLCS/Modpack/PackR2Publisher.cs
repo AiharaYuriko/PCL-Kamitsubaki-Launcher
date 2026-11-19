@@ -323,13 +323,16 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
 
     internal static byte[] JsonBytes(JObject value) => Encoding.UTF8.GetBytes(value.ToString(Formatting.None));
 
-    private sealed class S3Objects(string host, string bucket, string prefix, string region, string accessKey, string secretKey,
-        string label, bool conditionalWrites) : IDisposable {
+    internal sealed class S3Objects(string host, string bucket, string prefix, string region, string accessKey, string secretKey,
+        string label, bool conditionalWrites, HttpMessageHandler? handler = null) : IDisposable {
         private const int PartSize = 32 * 1024 * 1024;
+        private const int MaxConcurrentParts = 4;
         private string CacheForImmutable => conditionalWrites ? "public, max-age=31536000, immutable" : "private, no-store";
         private string? NewObjectCondition => conditionalWrites ? "if-none-match" : null;
         private static readonly HttpMethod Head = new("HEAD");
-        private readonly HttpClient client = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromMinutes(20) };
+        private readonly HttpClient client = new(handler ?? new HttpClientHandler {
+            AllowAutoRedirect = false, MaxConnectionsPerServer = MaxConcurrentParts
+        }) { Timeout = TimeSpan.FromMinutes(20) };
 
         internal (byte[]? Bytes, string? ETag) Read(string key) {
             using var response = Send(HttpMethod.Get, key);
@@ -405,21 +408,7 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
             string upload = "uploadId=" + Uri.EscapeDataString(id);
             bool completed = false;
             try {
-                var parts = new XElement("CompleteMultipartUpload");
-                using var input = File.OpenRead(path);
-                for (int number = 1; input.Position < size; number++) {
-                    var data = new byte[(int)Math.Min(partSize, size - input.Position)];
-                    int offset = 0;
-                    while (offset < data.Length) {
-                        int count = input.Read(data, offset, data.Length - offset);
-                        if (count == 0) throw new EndOfStreamException("ZIP 在分片上传期间发生变化。");
-                        offset += count;
-                    }
-                    progress($"正在上传完整 ZIP：{input.Position / 1048576d:F0} / {size / 1048576d:F0} MB（第 {number} 片）");
-                    string part = "partNumber=" + number.ToString(CultureInfo.InvariantCulture) + "&" + upload;
-                    string etag = RetryPart(key, part, data);
-                    parts.Add(new XElement("Part", new XElement("PartNumber", number), new XElement("ETag", etag)));
-                }
+                var parts = UploadParts(key, path, size, partSize, upload, progress);
                 using var commit = Send(HttpMethod.Post, key, upload, Encoding.UTF8.GetBytes(parts.ToString(SaveOptions.DisableFormatting)),
                     "application/xml", condition: NewObjectCondition, conditionValue: "*");
                 if (commit.StatusCode == HttpStatusCode.PreconditionFailed && HasArchive(key, size, hash)) return;
@@ -436,15 +425,65 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
             }
         }
 
-        private string RetryPart(string key, string query, byte[] data) {
-            for (int attempt = 0; ; attempt++) {
+        private XElement UploadParts(string key, string path, long size, long partSize, string upload, Action<string> progress) {
+            int partCount = (int)((size + partSize - 1) / partSize);
+            var etags = new string[partCount];
+            // Reduce concurrency when large archives require larger part buffers.
+            int concurrency = (int)Math.Max(1, Math.Min(partCount, MaxConcurrentParts * (long)PartSize / partSize));
+            using var input = File.OpenRead(path);
+            using var stop = new CancellationTokenSource();
+            var gate = new object();
+            int nextPart = 0, uploadedParts = 0;
+            long uploadedBytes = 0;
+
+            void ReportProgress() => progress($"正在上传完整 ZIP 到 {label}：{uploadedBytes / 1048576d:F0} / {size / 1048576d:F0} MiB（已完成 {uploadedParts}/{partCount} 片）");
+
+            async Task UploadWorker() {
                 try {
-                    using var put = Send(HttpMethod.Put, key, query, data);
+                    while (true) {
+                        int partIndex;
+                        byte[] data;
+                        lock (gate) {
+                            if (stop.IsCancellationRequested || nextPart == partCount) return;
+                            partIndex = nextPart++;
+                            data = new byte[(int)Math.Min(partSize, size - input.Position)];
+                            int offset = 0;
+                            while (offset < data.Length) {
+                                int count = input.Read(data, offset, data.Length - offset);
+                                if (count == 0) throw new EndOfStreamException("ZIP 在分片上传期间发生变化。");
+                                offset += count;
+                            }
+                        }
+                        string query = "partNumber=" + (partIndex + 1).ToString(CultureInfo.InvariantCulture) + "&" + upload;
+                        etags[partIndex] = await RetryPart(key, query, data, stop.Token).ConfigureAwait(false);
+                        lock (gate) {
+                            uploadedBytes += data.Length;
+                            uploadedParts++;
+                            ReportProgress();
+                        }
+                    }
+                } catch {
+                    stop.Cancel();
+                    throw;
+                }
+            }
+
+            ReportProgress();
+            Task.WhenAll(Enumerable.Range(0, concurrency).Select(_ => UploadWorker())).GetAwaiter().GetResult();
+            return new XElement("CompleteMultipartUpload", etags.Select((etag, index) =>
+                new XElement("Part", new XElement("PartNumber", index + 1), new XElement("ETag", etag))));
+        }
+
+        private async Task<string> RetryPart(string key, string query, byte[] data, CancellationToken cancellation) {
+            for (int attempt = 0; ; attempt++) {
+                cancellation.ThrowIfCancellationRequested();
+                try {
+                    using var put = await SendAsync(HttpMethod.Put, key, query, data, cancellation: cancellation).ConfigureAwait(false);
                     if (attempt < 2 && ((int)put.StatusCode >= 500 || (int)put.StatusCode == 429)) continue;
                     Ensure(put, "上传 ZIP 分片");
                     return put.Headers.ETag?.ToString() ?? throw new IOException(label + " 未返回分片 ETag。");
-                } catch (HttpRequestException) when (attempt < 2) { }
-                catch (OperationCanceledException) when (attempt < 2) { }
+                } catch (HttpRequestException) when (attempt < 2 && !cancellation.IsCancellationRequested) { }
+                catch (OperationCanceledException) when (attempt < 2 && !cancellation.IsCancellationRequested) { }
             }
         }
 
@@ -458,7 +497,12 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
         }
 
         private HttpResponseMessage Send(HttpMethod method, string key, string query = "", byte[]? body = null, string? type = null,
-            string? cache = null, string? condition = null, string? conditionValue = null, string? metadata = null) {
+            string? cache = null, string? condition = null, string? conditionValue = null, string? metadata = null) =>
+            SendAsync(method, key, query, body, type, cache, condition, conditionValue, metadata).GetAwaiter().GetResult();
+
+        private async Task<HttpResponseMessage> SendAsync(HttpMethod method, string key, string query = "", byte[]? body = null, string? type = null,
+            string? cache = null, string? condition = null, string? conditionValue = null, string? metadata = null,
+            CancellationToken cancellation = default) {
             DateTime time = DateTime.UtcNow;
             string day = time.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
             string stamp = time.ToString("yyyyMMdd'T'HHmmss'Z'", CultureInfo.InvariantCulture);
@@ -485,7 +529,7 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
                 request.Content = new ByteArrayContent(body ?? Array.Empty<byte>());
                 if (type != null) request.Content.Headers.ContentType = new MediaTypeHeaderValue(type);
             }
-            return client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
+            return await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellation).ConfigureAwait(false);
         }
         private static XElement ReadXml(HttpResponseMessage response) => XElement.Parse(response.Content.ReadAsStringAsync().GetAwaiter().GetResult());
         private static byte[] Hmac(byte[] key, string value) {

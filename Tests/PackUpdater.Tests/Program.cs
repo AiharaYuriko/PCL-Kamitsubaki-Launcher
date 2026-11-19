@@ -44,6 +44,7 @@ internal static partial class Program {
         };
     static void Main() {
         TestArchiveLinks();
+        TestMultipartUpload();
         Test("official update source has its own default mirror and explicit disable is saved", root => {
             foreach (string source in new[] { "https://r2.kaf.mom", "https://R2.KAF.MOM/", "https://r2.kaf.mom/pcl/index.json" })
                 Assert(PackMirror.DefaultAddressFor(source) == PackMirror.DefaultAddress, "Official source should have the official mirror");
