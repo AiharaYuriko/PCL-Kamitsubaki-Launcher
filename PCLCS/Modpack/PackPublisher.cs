@@ -30,7 +30,10 @@ public sealed class PackPublishDetails {
     public string Minecraft { get; set; } = "";
     public string NeoForge { get; set; } = "";
     public bool AllowDowngrade { get; set; }
+    public string? BaselineId { get; set; }
 }
+
+public sealed record PackBaseline(string Id, string Name);
 
 public sealed class PackPublisher(string root) {
     public const string Automatic = "自动";
@@ -43,12 +46,31 @@ public sealed class PackPublisher(string root) {
     public static readonly string[] Operations = [Automatic, Force, Delete, Disable, Preserve, Patch, Exclude];
     public static readonly string[] DefaultFolders = ["mods", "config", "defaultconfigs", "kubejs", "scripts", "resourcepacks", "shaderpacks"];
     private static readonly DateTimeOffset ZipDate = new(2000, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    private const string LegacyBaselineId = "legacy";
+    private const string LegacyBaselineName = "原有基线";
 
     internal string ProjectFile(string name) => PackProtocol.Safe(root, ".pcl-update/publisher/" + name, true);
     public JObject Settings => Read("settings.json");
     public void SaveSettings(JObject settings) => PackUpdater.Atomic(ProjectFile("settings.json"), settings);
-    public bool HasBaseline => File.Exists(ProjectFile("baseline.json"));
+    public bool HasBaseline => Baselines.Count != 0;
     public JObject Latest => Read("latest.json");
+
+    public IReadOnlyList<PackBaseline> Baselines => BaselinesFor(null);
+
+    public IReadOnlyList<PackBaseline> BaselinesFor(string? scope) {
+        var result = new List<PackBaseline>();
+        if (File.Exists(ProjectFile("baseline.json"))) result.Add(new(LegacyBaselineId, LegacyBaselineName));
+        string directory = ProjectFile("baselines");
+        if (Directory.Exists(directory)) {
+            var named = Directory.EnumerateFiles(directory, "*.json").Select(Path.GetFileNameWithoutExtension)
+                .Where(id => IsStoredBaselineId(id) && (!id.StartsWith("cloud-", StringComparison.Ordinal) ||
+                    (scope != null && id.StartsWith("cloud-" + scope + "-", StringComparison.Ordinal))))
+                .Select(id => new PackBaseline(id,
+                    (string)Read(BaselinePath(id))["name"]! + (id.StartsWith("cloud-", StringComparison.Ordinal) ? "（云端）" : "")));
+            result.AddRange(named.OrderBy(b => b.Name, StringComparer.CurrentCultureIgnoreCase));
+        }
+        return result;
+    }
 
     public static string? PublishedSource(JObject manifest) {
         string? archive = (string?)manifest["archive"]?["download_url"];
@@ -101,24 +123,30 @@ public sealed class PackPublisher(string root) {
         return PackProtocol.Safe(root, path);
     }
 
-    public List<PackPublishFile> Scan(IEnumerable<string> folders, bool compare = true, IEnumerable<string>? files = null) {
+    private static IEnumerable<string> ScanFolders(IEnumerable<string> folders) => folders
+        .Select(f => f.Trim().Replace('\\', '/').TrimEnd('/')).Where(f => f.Length != 0).Distinct(StringComparer.OrdinalIgnoreCase);
+
+    public List<PackPublishFile> Scan(IEnumerable<string> folders, bool compare = true, IEnumerable<string>? files = null, string? baselineId = null) =>
+        Scan(folders, compare, files, baselineId, includeMaps: true);
+
+    private List<PackPublishFile> Scan(IEnumerable<string> folders, bool compare, IEnumerable<string>? files, string? baselineId, bool includeMaps) {
         var result = new Dictionary<string, PackPublishFile>(StringComparer.OrdinalIgnoreCase);
         foreach (string file in files ?? Enumerable.Empty<string>()) {
             string path = file.Replace('\\', '/');
             Add(path, ResolveImportFile(path));
         }
-        foreach (string folder in folders.Select(f => f.Trim().Replace('\\', '/').TrimEnd('/')).Where(f => f.Length != 0).Distinct(StringComparer.OrdinalIgnoreCase)) {
+        foreach (string folder in ScanFolders(folders)) {
             string full = ResolveScanPath(folder);
             if (File.Exists(full)) Add(folder, full);
             else if (Directory.Exists(full)) Walk(full, folder, Add);
         }
-        foreach (JObject map in ReadMaps()) {
+        foreach (JObject map in includeMaps ? ReadMaps() : new JArray()) {
             string published = (string)map["path"]!;
             string source = ProjectFile("maps/" + (string)map["snapshot"]!);
             if ((bool?)map["file"] == true) Add(published, source);
             else Walk(source, published, Add);
         }
-        if (compare) AddChanges(result);
+        if (compare) AddChanges(result, baselineId);
         return result.Values.OrderBy(f => f.Path, StringComparer.OrdinalIgnoreCase).ToList();
 
         void Add(string path, string full) {
@@ -140,16 +168,155 @@ public sealed class PackPublisher(string root) {
     }
 
     public void SaveBaseline(IEnumerable<PackPublishFile> files) {
-        if (HasBaseline) throw new IOException("此实例已建立基线。");
+        StoreBaseline(LegacyBaselineId, LegacyBaselineName, InstanceName(root), VerifySnapshot(files));
+    }
+
+    public PackBaseline SaveBaseline(string name, IEnumerable<PackPublishFile> files) =>
+        SaveNamedBaseline(name, InstanceName(root), VerifySnapshot(files));
+
+    public PackBaseline ImportBaselineFolder(string name, string source, IEnumerable<string> folders, IEnumerable<string> paths) {
+        var old = new PackPublisher(source);
+        var existingPaths = paths.Select(p => p.Replace('\\', '/')).Where(p => File.Exists(old.ResolveScanPath(p)));
+        var files = old.Scan(folders, compare: false, files: existingPaths, baselineId: null, includeMaps: false);
+        return SaveNamedBaseline(name, InstanceName(source), old.VerifySnapshot(files));
+    }
+
+    public PackBaseline ImportBaselineZip(string name, string source, IEnumerable<string> folders, IEnumerable<string> paths) {
+        using var stream = File.OpenRead(source);
+        using var zip = new ZipArchive(stream, ZipArchiveMode.Read);
+        // Platform archives can omit the actual Mod bytes needed for the baseline hashes.
+        if (zip.GetEntry("manifest.json") is { } curseForge) {
+            using var reader = new StreamReader(curseForge.Open());
+            if ((string?)JObject.Parse(reader.ReadToEnd())["manifestType"] == "minecraftModpack")
+                throw new InvalidDataException("请先安装 CurseForge 整合包，再从已安装的旧实例目录导入基线。");
+        }
+        if (zip.GetEntry("modrinth.index.json") is { } modrinth) {
+            using var reader = new StreamReader(modrinth.Open());
+            if (JObject.Parse(reader.ReadToEnd())["files"] is JArray { Count: > 0 })
+                throw new InvalidDataException("请先安装带平台下载项的整合包，再从已安装的旧实例目录导入基线。");
+        }
+
+        var entries = new List<(string Prefix, string Path, ZipArchiveEntry Entry)>();
+        foreach (var entry in zip.Entries.Where(e => e.Name.Length != 0)) {
+            string full = entry.FullName.Replace('\\', '/');
+            string[] parts = full.Split('/');
+            int top = Array.FindIndex(parts, 0, parts.Length - 1, p => DefaultFolders.Contains(p, StringComparer.OrdinalIgnoreCase));
+            if (top < 0) continue;
+            PackProtocol.ValidateRelative(full, true);
+            entries.Add((string.Join("/", parts.Take(top)), string.Join("/", parts.Skip(top)), entry));
+        }
+        var prefixes = entries.Select(e => e.Prefix).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(p => p.Length).ToList();
+        if (prefixes.Count == 0) throw new InvalidDataException("ZIP 中找不到实例的整合包文件。");
+        string prefix = prefixes[0];
+        if (prefix.Length != 0 && prefixes.Skip(1).Any(p => !p.StartsWith(prefix + "/", StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidDataException("ZIP 中包含多个实例，请选择只包含一个实例的 ZIP。");
+
+        var selectedFolders = ScanFolders(folders).ToArray();
+        var selectedPaths = new HashSet<string>(paths.Select(p => p.Replace('\\', '/')), StringComparer.OrdinalIgnoreCase);
+        var snapshot = new List<JObject>();
+        foreach (var item in entries.Where(e => string.Equals(e.Prefix, prefix, StringComparison.OrdinalIgnoreCase))) {
+            string path = item.Path;
+            if (path.StartsWith("mods/", StringComparison.OrdinalIgnoreCase) && !PackProtocol.ManagedMod(path)) continue;
+            if (!selectedPaths.Contains(path)) {
+                bool inScope = selectedFolders.Any(f => path.Equals(f, StringComparison.OrdinalIgnoreCase) ||
+                    path.StartsWith(f + "/", StringComparison.OrdinalIgnoreCase));
+                if (!inScope || path.Split('/').Any(SkipScannedName)) continue;
+            }
+            using var input = item.Entry.Open();
+            var file = new PackPublishFile { Path = path, Sha256 = PackProtocol.HashStream(input) };
+            if (PackProtocol.ManagedMod(path)) {
+                using var mod = item.Entry.Open();
+                file.ModId = ReadModId(mod);
+            }
+            snapshot.Add(Snapshot(file));
+        }
+        string instance = prefix.Length == 0 || prefix.Equals("overrides", StringComparison.OrdinalIgnoreCase)
+            ? Path.GetFileNameWithoutExtension(source) : prefix.Split('/').Last();
+        return SaveNamedBaseline(name, instance, snapshot);
+    }
+
+    private IEnumerable<JObject> VerifySnapshot(IEnumerable<PackPublishFile> files) {
         var included = files.Where(f => f.LocalPath.Length > 0 && f.Category != "map" && f.Operation != Exclude).ToList();
         foreach (var file in included)
             if (!PackArchive.Matches(PackProtocol.Safe(root, file.Path), file.Size, file.Sha256))
                 throw new IOException("扫描后文件发生变化，请重新扫描：" + file.Path);
-        var snapshot = included.Select(Snapshot).ToList();
-        if (snapshot.Count == 0) throw new IOException("请选择至少一个旧整合包文件。");
-        PackUpdater.Atomic(ProjectFile("baseline.json"), new JObject {
-            ["instance"] = Path.GetFileName(Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar)), ["files"] = new JArray(snapshot)
-        });
+        return included.Select(Snapshot);
+    }
+
+    private static string InstanceName(string path) => Path.GetFileName(Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar));
+    private static bool IsStoredBaselineId(string id) => Regex.IsMatch(id, "\\A(?:[0-9a-f]{32}|cloud-[0-9a-f]{16}-[0-9a-f]{24})\\z");
+    private static string BaselinePath(string id) => id == LegacyBaselineId ? "baseline.json" :
+        IsStoredBaselineId(id) ? "baselines/" + id + ".json" : throw new InvalidDataException("无效的整合包基线。");
+
+    internal static bool ValidBaselineName(string? name) =>
+        name != null && name.Length >= 1 && name.Length <= 80 && name == name.Trim() && !name.Any(char.IsControl);
+    private static string NamedBaselineId(string name) => PackProtocol.Hash(Encoding.UTF8.GetBytes(name.ToUpperInvariant())).Substring(0, 32);
+
+    private PackBaseline SaveNamedBaseline(string name, string instance, IEnumerable<JObject> files) {
+        name = name.Trim();
+        if (!ValidBaselineName(name) || name == LegacyBaselineName)
+            throw new InvalidDataException("请输入 1 至 80 个字符的基线名称，并避开保留名称「原有基线」。");
+        string id = NamedBaselineId(name);
+        StoreBaseline(id, name, instance, files);
+        return new PackBaseline(id, name);
+    }
+
+    private void StoreBaseline(string id, string name, string instance, IEnumerable<JObject> files) {
+        var snapshot = files.OrderBy(f => (string)f["path"]!, StringComparer.OrdinalIgnoreCase).ToList();
+        if (snapshot.Count == 0) throw new IOException("当前扫描范围内没有可保存的旧整合包文件。");
+        var document = new JObject { ["name"] = name, ["instance"] = instance, ["files"] = new JArray(snapshot) };
+        ValidateBaselineDocument(document);
+        WriteBaseline(id, document);
+    }
+
+    internal static void ValidateBaselineDocument(JObject document) {
+        if (document["name"]?.Type != JTokenType.String || !ValidBaselineName((string?)document["name"]) ||
+            document["instance"]?.Type != JTokenType.String || string.IsNullOrWhiteSpace((string?)document["instance"]) ||
+            document["files"] is not JArray { Count: > 0 } snapshot)
+            throw new InvalidDataException("整合包基线清单格式无效。");
+        var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in snapshot) {
+            if (entry is not JObject file || file["path"]?.Type != JTokenType.String || file["sha256"]?.Type != JTokenType.String ||
+                !Regex.IsMatch((string)file["sha256"]!, "\\A[0-9a-f]{64}\\z") ||
+                (file["id"] != null && (file["id"]!.Type != JTokenType.String || !Regex.IsMatch((string)file["id"]!, "\\A[a-z][a-z0-9_]{1,63}\\z"))) ||
+                file.Properties().Any(p => p.Name != "path" && p.Name != "sha256" && p.Name != "id"))
+                throw new InvalidDataException("基线包含无效的文件记录。");
+            string path = (string)file["path"]!;
+            PackProtocol.ValidateRelative(path, false);
+            if (!unique.Add(PackProtocol.ManagedMod(path) ? PackProtocol.EnabledModPath(path) : path))
+                throw new InvalidDataException("基线包含重复文件：" + path);
+        }
+    }
+
+    internal JObject BaselineDocument(string id) {
+        var saved = Read(BaselinePath(id));
+        if (saved["files"] == null) return saved;
+        return new JObject { ["name"] = id == LegacyBaselineId ? new JValue(LegacyBaselineName) : saved["name"],
+            ["instance"] = saved["instance"], ["files"] = saved["files"] };
+    }
+
+    internal void CacheCloudBaseline(JObject document, string scope, string hash) {
+        ValidateBaselineDocument(document);
+        string name = (string)document["name"]!;
+        var local = BaselineDocument(name == LegacyBaselineName ? LegacyBaselineId : NamedBaselineId(name));
+        if (JToken.DeepEquals(local, document)) return;
+        string id = "cloud-" + scope + "-" + hash.Substring(0, 24);
+        if (JToken.DeepEquals(BaselineDocument(id), document)) return;
+        WriteBaseline(id, document);
+    }
+
+    private void WriteBaseline(string id, JObject value) {
+        string destination = ProjectFile(BaselinePath(id));
+        if (File.Exists(destination)) throw new IOException("已有同名基线：" + (string?)value["name"]);
+        string directory = Path.GetDirectoryName(destination)!;
+        Directory.CreateDirectory(directory);
+        string temporary = Path.Combine(directory, Guid.NewGuid().ToString("N") + ".tmp");
+        try {
+            File.WriteAllText(temporary, value.ToString(Formatting.Indented), new UTF8Encoding(false));
+            File.Move(temporary, destination);
+        } finally {
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
     }
 
     public string ImportXaeroMap(string source, string revision) {
@@ -215,15 +382,19 @@ public sealed class PackPublisher(string root) {
         path.StartsWith("XaeroWaypoints/", StringComparison.OrdinalIgnoreCase);
     private JArray ReadMaps() => Read("maps.json")["maps"] as JArray ?? new JArray();
     private JObject Read(string name) => File.Exists(ProjectFile(name)) ? PackProtocol.Parse(File.ReadAllBytes(ProjectFile(name))) : new JObject();
-    private JArray Baseline => Read("baseline.json")["files"] as JArray ?? throw new IOException("请先建立旧整合包基线。");
-    private List<JObject> KnownFiles() => Baseline.Cast<JObject>().Concat((Read("latest.json")["files"] as JArray ?? new JArray()).Cast<JObject>()).ToList();
+    private JObject ReadBaseline(string? id) {
+        id ??= Baselines.FirstOrDefault()?.Id;
+        return id == null ? new JObject() : Read(BaselinePath(id));
+    }
 
-    private void AddChanges(Dictionary<string, PackPublishFile> result) {
-        if (!HasBaseline) {
+    private void AddChanges(Dictionary<string, PackPublishFile> result, string? baselineId) {
+        if (ReadBaseline(baselineId)["files"] is not JArray baseline) {
+            if (baselineId != null) throw new IOException("找不到所选基线，请重新选择。");
             foreach (var file in result.Values) file.Change = "基线候选";
             return;
         }
-        var previous = (Read("latest.json")["files"] as JArray ?? Baseline).Cast<JObject>()
+        var comparison = baselineId == null ? Latest["files"] as JArray ?? baseline : baseline;
+        var previous = comparison.Cast<JObject>()
             .ToDictionary(f => (string)f["path"]!, StringComparer.OrdinalIgnoreCase);
         foreach (var file in result.Values) file.Change = !previous.TryGetValue(file.Path, out var old) ? "新增" :
             file.Sha256 == (string?)old["sha256"] ? "相同" : "更新";
@@ -241,6 +412,8 @@ public sealed class PackPublisher(string root) {
 
     internal JObject Build(PackPublishDetails details, IReadOnlyList<PackPublishFile> files, long sequence, string archivePath, string publicRoot) {
         ValidateDetails(details);
+        var snapshot = ReadBaseline(details.BaselineId);
+        if (snapshot["files"] is not JArray baseline) throw new IOException("请先保存并选择整合包基线。");
         var manifest = new JObject {
             ["schema"] = PackProtocol.ArchiveRelease,
             ["pack"] = new JObject { ["id"] = details.PackId, ["name"] = details.Name },
@@ -250,10 +423,11 @@ public sealed class PackPublisher(string root) {
                 ["minecraft_change"] = "new-instance", ["allow_loader_downgrade"] = details.AllowDowngrade
             },
             ["components"] = new JArray(), ["files"] = new JArray(), ["actions"] = new JArray(),
-            ["baseline"] = Baseline.DeepClone(), ["cleanup"] = "previously-managed-unmodified"
+            ["baseline"] = baseline.DeepClone(), ["cleanup"] = "previously-managed-unmodified"
         };
-        if ((string?)Read("baseline.json")["instance"] is string originalInstance) manifest["baseline_instance"] = originalInstance;
-        var known = KnownFiles();
+        if ((string?)snapshot["instance"] is string originalInstance) manifest["baseline_instance"] = originalInstance;
+        var latest = (Latest["files"] as JArray ?? new JArray()).Cast<JObject>();
+        var known = (details.BaselineId == null ? baseline.Cast<JObject>().Concat(latest) : latest.Concat(baseline.Cast<JObject>())).ToList();
         var online = new JArray();
         var offsets = new Dictionary<string, (long HeaderOffset, JObject Target)>();
         Directory.CreateDirectory(Path.GetDirectoryName(archivePath)!);
@@ -356,16 +530,22 @@ public sealed class PackPublisher(string root) {
 
     internal static void ValidateDetails(PackPublishDetails details) {
         foreach (string value in new[] { details.PackId, details.Channel, details.ReleaseId })
-            if (!Regex.IsMatch(value, "^[a-z0-9][a-z0-9._-]{0,127}$") || value.EndsWith(".", StringComparison.Ordinal))
-                throw new InvalidDataException("整合包、频道和发布 ID 只能使用英文小写、数字、点、连字符和下划线。");
+            ValidateIdentifier(value);
         if (string.IsNullOrWhiteSpace(details.Name)) throw new InvalidDataException("请填写整合包名称。");
     }
+    internal static void ValidateIdentifier(string value) {
+        if (!Regex.IsMatch(value, "\\A[a-z0-9][a-z0-9._-]{0,127}\\z") || value.EndsWith(".", StringComparison.Ordinal))
+            throw new InvalidDataException("请填写有效的整合包、频道或发布 ID，可使用英文小写、数字、点、连字符和下划线。");
+    }
+    private static bool SkipScannedName(string name) =>
+        name.StartsWith(".", StringComparison.Ordinal) || name.Equals("session.lock", StringComparison.OrdinalIgnoreCase);
+
     private static void Walk(string directory, string relative, Action<string, string> add) {
         if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) throw new IOException("发布目录包含链接：" + directory);
         foreach (string path in Directory.EnumerateFileSystemEntries(directory)) {
             var info = File.GetAttributes(path);
             string name = Path.GetFileName(path);
-            if (name.StartsWith(".", StringComparison.Ordinal) || name.Equals("session.lock", StringComparison.OrdinalIgnoreCase)) continue;
+            if (SkipScannedName(name)) continue;
             if ((info & FileAttributes.ReparsePoint) != 0) throw new IOException("发布目录包含链接：" + path);
             string entry = relative.Length == 0 ? name : relative + "/" + name;
             if ((info & FileAttributes.Directory) != 0) Walk(path, entry, add);
@@ -373,8 +553,11 @@ public sealed class PackPublisher(string root) {
         }
     }
     internal static string? ReadModId(string path) {
+        using var input = File.OpenRead(path);
+        return ReadModId(input);
+    }
+    private static string? ReadModId(Stream input) {
         try {
-            using var input = File.OpenRead(path);
             using var zip = new ZipArchive(input);
             var entry = zip.GetEntry("META-INF/neoforge.mods.toml") ?? zip.GetEntry("META-INF/mods.toml");
             if (entry == null || entry.Length > 256 * 1024) return null;

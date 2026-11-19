@@ -6,7 +6,7 @@
         <StackPanel Margin="25,10">
             <local:MyCard x:Name="PublishCard" Title="整合包发布" Margin="0,15,0,15">
                 <StackPanel Margin="25,40,25,20">
-                    <TextBlock Text="请先用原始客户端整合包建立基线，再修改此实例。可以扫描目录，也可以导入指定文件；只用指定文件时请清空扫描目录。" TextWrapping="Wrap" Margin="0,0,0,10" />
+                    <TextBlock Text="保存旧包基线后，选择本次发布要迁移的旧版本。基线导入使用下方的扫描目录和指定文件范围。" TextWrapping="Wrap" Margin="0,0,0,10" />
                     <UniformGrid Columns="2">
                         <local:MyTextBox x:Name="PackName" HintText="整合包显示名称" Margin="0,0,6,6" Height="32" />
                         <local:MyTextBox x:Name="PackId" HintText="整合包 ID（例 kamitsubaki-city）" Margin="0,0,0,6" Height="32" />
@@ -16,10 +16,17 @@
                     <local:MyTextBox x:Name="PublishNotes" HintText="发布说明" Margin="0,0,0,6" MinHeight="32" AcceptsReturn="True" TextWrapping="Wrap" />
                     <local:MyTextBox x:Name="PublishFolders" HintText="扫描目录，每行一个或用分号分隔" Margin="0,0,0,6" MinHeight="45" AcceptsReturn="True" TextWrapping="Wrap" />
                     <local:MyTextBox x:Name="PublishFilePaths" HintText="指定文件（实例内相对路径，每行一个）" Margin="0,0,0,6" MinHeight="32" MaxHeight="100" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
+                    <DockPanel Margin="0,4,0,6">
+                        <TextBlock Text="发布基线" VerticalAlignment="Center" Margin="0,0,10,0" />
+                        <local:MyComboBox x:Name="PublishBaselineChoice" Height="32" AutomationProperties.Name="发布基线"
+                                          DisplayMemberPath="Name" />
+                    </DockPanel>
                     <WrapPanel Margin="0,4,0,8">
                         <local:MyButton x:Name="PublishScan" Text="扫描并预览" Height="34" MinWidth="110" Margin="0,0,8,4" />
                         <local:MyButton x:Name="PublishImportFiles" Text="导入指定文件" Height="34" MinWidth="110" Margin="0,0,8,4" />
-                        <local:MyButton x:Name="PublishBaseline" Text="保存旧包基线" Height="34" MinWidth="110" Margin="0,0,8,4" />
+                        <local:MyButton x:Name="PublishBaseline" Text="保存预览为基线" Height="34" MinWidth="120" Margin="0,0,8,4" />
+                        <local:MyButton x:Name="PublishBaselineZip" Text="导入旧包 ZIP" Height="34" MinWidth="110" Margin="0,0,8,4" />
+                        <local:MyButton x:Name="PublishBaselineFolder" Text="导入旧实例目录" Height="34" MinWidth="120" Margin="0,0,8,4" />
                         <local:MyButton x:Name="PublishMaps" Text="导入 Xaero 地图" Height="34" MinWidth="125" Margin="0,0,8,4" />
                         <local:MyButton x:Name="PublishWaypoints" Text="导入 Xaero 航点" Height="34" MinWidth="125" Margin="0,0,8,4" />
                         <local:MyButton x:Name="PublishSelectZip" Text="确认全部 Mod 可公开分发" Height="34" MinWidth="185" Margin="0,0,8,4" />
@@ -45,6 +52,12 @@
                         <TextBlock Text="R2 Secret Access Key" VerticalAlignment="Center" />
                         <PasswordBox x:Name="PublishSecret" Margin="0,0,0,6" Height="32" VerticalContentAlignment="Center" />
                     </UniformGrid>
+                    <TextBlock Text="私有 R2 基线桶（可选，保存基线时自动上传）" Margin="0,4,0,4" TextWrapping="Wrap" />
+                    <local:MyTextBox x:Name="PublishBaselineBucket" HintText="私有基线桶名称，使用上方 R2 凭据" Height="32" Margin="0,0,0,6" />
+                    <WrapPanel>
+                        <local:MyButton x:Name="PublishBaselineSync" Text="同步云端基线" Height="34" MinWidth="115" Margin="0,0,8,4" />
+                        <local:MyButton x:Name="PublishBaselineUpload" Text="上传所选基线" Height="34" MinWidth="115" Margin="0,0,0,4" />
+                    </WrapPanel>
                     <local:MyCheckBox x:Name="PublishMirror" Text="发布后同步到备用 S3（OSCA）" Margin="0,12,0,6" />
                     <UniformGrid x:Name="PublishMirrorCredentials" Columns="2">
                         <StackPanel Margin="0,0,6,6">

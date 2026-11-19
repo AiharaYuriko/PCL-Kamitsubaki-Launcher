@@ -1,5 +1,6 @@
 using Newtonsoft.Json.Linq;
 using PCL.Modpack;
+using System.IO.Compression;
 using System.Text;
 
 internal static partial class Program {
@@ -343,6 +344,76 @@ internal static partial class Program {
             var release = publisher.Build(Details(), draft, 1, Path.Combine(root, "selected.zip"), "https://example.com");
             Assert((string?)release["baseline"]!.Single()["path"] == selected &&
                 (string?)release["files"]!.Single()["path"] == selected, "Selection did not reach the release");
+        });
+        Test("saved and imported baselines stay separate when previewing and building releases", root => {
+            string author = Path.Combine(root, "author"), old = Path.Combine(root, "old-instance");
+            string sourceZip = Path.Combine(root, "source.zip"), releaseZip = Path.Combine(root, "release.zip");
+            const string rules = "config/rules.toml", removed = "config/old.toml";
+            Write(author, rules, "legacy");
+            var publisher = new PackPublisher(author);
+            var folders = new[] { "config" };
+            publisher.SaveBaseline(publisher.Scan(folders));
+            Write(old, rules, "folder");
+            var folder = publisher.ImportBaselineFolder("测试 A", old, folders, Array.Empty<string>());
+            using (var zip = new ZipArchive(File.Create(sourceZip), ZipArchiveMode.Create)) {
+                foreach (string path in new[] { rules, removed, "saves/world/level.dat" }) {
+                    using var writer = new StreamWriter(zip.CreateEntry("pack/.minecraft/versions/zipped/" + path).Open());
+                    writer.Write("zip");
+                }
+            }
+            var archive = publisher.ImportBaselineZip("测试 B", sourceZip, Array.Empty<string>(), new[] { rules, removed });
+            Throws(() => publisher.ImportBaselineFolder(folder.Name, old, folders, Array.Empty<string>()));
+            File.Delete(sourceZip);
+            Write(author, rules, "folder");
+            publisher = new PackPublisher(author);
+            Assert(publisher.Baselines.Count == 3, "Legacy and both named baselines should survive reopening");
+            var details = Details();
+            details.BaselineId = folder.Id;
+            var folderDraft = publisher.Scan(folders, baselineId: folder.Id);
+            Assert(folderDraft.Single().Change == "相同", "Preview should use the selected folder baseline");
+            var folderRelease = publisher.Build(details, folderDraft, 1, releaseZip, "https://example.com");
+            publisher.Remember(folderRelease);
+            details.BaselineId = archive.Id;
+            var zipDraft = publisher.Scan(folders, baselineId: archive.Id);
+            Assert(zipDraft.Single(f => f.Path == rules).Change == "更新" &&
+                zipDraft.Single(f => f.Path == removed).Change == "已移出", "Preview should use the selected ZIP instead of the latest release");
+            var zipRelease = publisher.Build(details, zipDraft, 2, releaseZip, "https://example.com");
+            Assert((string?)zipRelease["baseline_instance"] == "zipped" && zipRelease["baseline"]!.Count() == 2 &&
+                zipRelease["baseline"]!.All(f => (string?)f["sha256"] == PackProtocol.Hash(Encoding.UTF8.GetBytes("zip"))),
+                "Release should carry only the selected ZIP snapshot");
+        });
+        Test("cloud baselines cache only verified records and stay scoped to the configured library", root => {
+            const string path = "config/rules.toml";
+            Write(root, path, "local");
+            var publisher = new PackPublisher(root);
+            var local = publisher.SaveBaseline("测试 A", publisher.Scan(new[] { "config" }));
+            string scope = PackR2Publisher.BaselineScope("account", "private-baselines", "pack-a");
+            string otherScope = PackR2Publisher.BaselineScope("account", "private-baselines", "pack-b");
+            var document = publisher.BaselineDocument(local.Id);
+            string Hash(JObject value) => PackProtocol.Hash(PackR2Publisher.JsonBytes(value));
+            publisher.CacheCloudBaseline(document, scope, Hash(document));
+            Assert(publisher.BaselinesFor(scope).Count == 1, "Identical snapshots should share one choice");
+            document["files"]![0]!["sha256"] = PackProtocol.Hash(Encoding.UTF8.GetBytes("remote"));
+            string hash = Hash(document);
+            publisher.CacheCloudBaseline(document, scope, hash);
+            publisher.CacheCloudBaseline(document, scope, hash);
+            publisher = new PackPublisher(root);
+            var remote = publisher.BaselinesFor(scope).Single(b => b.Id != local.Id);
+            Assert(remote.Name == "测试 A（云端）" && publisher.BaselinesFor(otherScope).Count == 1,
+                "Remote snapshots should remain distinct and scoped after reopening");
+            var draft = publisher.Scan(new[] { "config" }, baselineId: remote.Id);
+            var details = Details();
+            details.BaselineId = remote.Id;
+            var release = publisher.Build(details, draft, 1, Path.Combine(root, "release.zip"), "https://example.com");
+            Assert(draft.Single().Change == "更新" && JToken.DeepEquals(release["baseline"], document["files"]),
+                "The cloud choice should reach the release manifest");
+            var record = new JObject { ["name"] = "测试 A", ["sha256"] = hash };
+            var index = new JObject { ["baselines"] = new JArray(record) };
+            Assert(PackR2Publisher.ReadBaselineIndex(PackR2Publisher.JsonBytes(index)).Count == 1, "Valid cloud catalog should load");
+            ((JArray)index["baselines"]!).Add(record.DeepClone());
+            Throws(() => PackR2Publisher.ReadBaselineIndex(PackR2Publisher.JsonBytes(index)));
+            document["files"]![0]!["path"] = "saves/world";
+            Throws(() => publisher.CacheCloudBaseline(document, scope, Hash(document)));
         });
         Test("renamed mod is previewed together and only a verified duplicate is removed", root => {
             string author = Path.Combine(root, "author"), player = Path.Combine(root, "player");

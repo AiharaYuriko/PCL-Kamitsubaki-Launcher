@@ -16,16 +16,20 @@ public sealed class PackR2Settings {
     internal string Host => Account + ".r2.cloudflarestorage.com";
 
     internal Uri Validate() {
-        if (!Regex.IsMatch(Account, @"^[a-f0-9]{32}(?:\.(?:eu|us|fedramp))?$") ||
-            !Regex.IsMatch(Bucket, @"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"))
-            throw new InvalidDataException("请检查 R2 Account ID 和存储桶名称。");
+        ValidateBucketCredentials();
         PackProtocol.Https(PublicRoot);
         var address = new Uri(PublicRoot);
         if (address.Query.Length != 0 || !Regex.IsMatch(address.AbsolutePath, @"^/(?:[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*/?)?\z"))
             throw new InvalidDataException("公开地址应为 R2 自定义域名，可加桶内目录。目录名只能包含英文字母、数字、连字符和下划线。");
+        return address;
+    }
+
+    internal void ValidateBucketCredentials() {
+        if (!Regex.IsMatch(Account, @"^[a-f0-9]{32}(?:\.(?:eu|us|fedramp))?$") ||
+            !Regex.IsMatch(Bucket, @"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"))
+            throw new InvalidDataException("请检查 R2 Account ID 和存储桶名称。");
         if (!Regex.IsMatch(AccessKey, "^[a-zA-Z0-9]+$") || string.IsNullOrWhiteSpace(SecretKey))
             throw new InvalidDataException("请填写 R2 S3 Access Key ID 和 Secret Access Key。");
-        return address;
     }
 }
 
@@ -70,6 +74,78 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
 
     internal static string ObjectKey(Uri address, string key) => ObjectKey(address.AbsolutePath.Trim('/'), key);
     private static string ObjectKey(string prefix, string key) => prefix.Length == 0 ? key : prefix + "/" + key;
+
+    private static S3Objects OpenBaselines(PackR2Settings settings, string packId) {
+        PackPublisher.ValidateIdentifier(packId);
+        settings.ValidateBucketCredentials();
+        return new S3Objects(settings.Host, settings.Bucket, "pcl-baselines/" + packId, "auto",
+            settings.AccessKey, settings.SecretKey, "R2 云端基线", true);
+    }
+
+    public static string BaselineScope(string account, string bucket, string packId) =>
+        PackProtocol.Hash(Encoding.UTF8.GetBytes(account + "/" + bucket + "/" + packId)).Substring(0, 16);
+
+    internal static JArray ReadBaselineIndex(byte[]? bytes) {
+        if (bytes == null) return new JArray();
+        if (PackProtocol.Parse(bytes)["baselines"] is not JArray entries)
+            throw new InvalidDataException("云端基线目录格式无效。");
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in entries) {
+            if (item is not JObject entry || entry["name"]?.Type != JTokenType.String || entry["sha256"]?.Type != JTokenType.String ||
+                !PackPublisher.ValidBaselineName((string?)entry["name"]) ||
+                !Regex.IsMatch((string)entry["sha256"]!, "\\A[0-9a-f]{64}\\z") || !names.Add((string)entry["name"]!))
+                throw new InvalidDataException("云端基线目录包含无效或重复的记录。");
+        }
+        return entries;
+    }
+
+    public void UploadBaseline(PackR2Settings settings, string packId, string baselineId) {
+        var document = publisher.BaselineDocument(baselineId);
+        PackPublisher.ValidateBaselineDocument(document);
+        byte[] bytes = JsonBytes(document);
+        if (bytes.Length > ManifestLimit) throw new IOException("基线清单超过 8 MiB。");
+        string hash = PackProtocol.Hash(bytes);
+        string name = (string)document["name"]!;
+        using var cloud = OpenBaselines(settings, packId);
+        bool uploaded = false;
+        for (int attempt = 0; attempt < 5; attempt++) {
+            var previous = cloud.Read("index.json");
+            var entries = ReadBaselineIndex(previous.Bytes);
+            var match = entries.SingleOrDefault(e => string.Equals((string?)e["name"], name, StringComparison.OrdinalIgnoreCase));
+            if (match != null) {
+                if ((string?)match["sha256"] == hash) return;
+                throw new IOException("云端已有不同内容的同名基线，请使用其他名称：" + name);
+            }
+            if (!uploaded) {
+                string key = "snapshots/" + hash + ".json";
+                if (!cloud.TryPutJson(key, bytes, null) && cloud.Read(key).Bytes?.SequenceEqual(bytes) != true)
+                    throw new IOException("云端基线对象与本地清单不一致。");
+                uploaded = true;
+            }
+            entries.Add(new JObject { ["name"] = name, ["sha256"] = hash });
+            byte[] index = JsonBytes(new JObject { ["baselines"] = entries });
+            if (index.Length > ManifestLimit) throw new IOException("云端基线目录超过 8 MiB。");
+            if (cloud.TryPutJson("index.json", index, previous.ETag)) return;
+        }
+        throw new IOException("云端基线目录正在被其他发布端更新，请重试。");
+    }
+
+    public int SyncBaselines(PackR2Settings settings, string packId) {
+        using var cloud = OpenBaselines(settings, packId);
+        string scope = BaselineScope(settings.Account, settings.Bucket, packId);
+        var entries = ReadBaselineIndex(cloud.Read("index.json").Bytes);
+        foreach (var entry in entries) {
+            string name = (string)entry["name"]!;
+            string hash = (string)entry["sha256"]!;
+            byte[]? bytes = cloud.Read("snapshots/" + hash + ".json").Bytes;
+            if (bytes == null || PackProtocol.Hash(bytes) != hash)
+                throw new IOException("云端基线缺失或校验失败：" + name);
+            var document = PackProtocol.Parse(bytes);
+            if ((string?)document["name"] != name) throw new InvalidDataException("云端基线名称与目录不一致：" + name);
+            publisher.CacheCloudBaseline(document, scope, hash);
+        }
+        return entries.Count;
+    }
 
     public PackPublishResult Publish(PackPublishDetails details, PackR2Settings settings, IReadOnlyList<PackPublishFile> files, Action<string> progress,
         PackS3MirrorSettings? mirror = null) {
@@ -270,11 +346,16 @@ public sealed class PackR2Publisher(PackPublisher publisher) {
             return (output.ToArray(), response.Headers.ETag?.ToString() ?? throw new IOException(label + " 未返回清单 ETag。"));
         }
         internal void PutIndex(string key, byte[] bytes, string? etag) {
+            if (!TryPutJson(key, bytes, etag, "切换频道"))
+                throw new IOException("频道已被其他发布修改，请重新读取后重试。");
+        }
+        internal bool TryPutJson(string key, byte[] bytes, string? etag, string operation = "保存云端基线") {
             using var response = Send(HttpMethod.Put, key, body: bytes, type: "application/json", cache: "no-store",
                 condition: conditionalWrites ? (etag == null ? "if-none-match" : "if-match") : null, conditionValue: etag ?? "*");
             if (response.StatusCode == HttpStatusCode.PreconditionFailed)
-                throw new IOException("频道已被其他发布修改，请重新读取后重试。");
-            Ensure(response, "切换频道");
+                return false;
+            Ensure(response, operation);
+            return true;
         }
         internal bool PointsTo(string key, PackPublishDetails details, string hash) {
             try {

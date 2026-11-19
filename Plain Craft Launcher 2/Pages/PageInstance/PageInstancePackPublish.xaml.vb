@@ -27,6 +27,10 @@ Public Class PageInstancePackPublish
         AddHandler PublishScan.Click, Async Sub() Await ScanPublisher()
         AddHandler PublishImportFiles.Click, Async Sub() Await ImportPublisherFiles()
         AddHandler PublishBaseline.Click, Async Sub() Await RecordBaseline()
+        AddHandler PublishBaselineZip.Click, Async Sub() Await ImportBaseline(True)
+        AddHandler PublishBaselineFolder.Click, Async Sub() Await ImportBaseline(False)
+        AddHandler PublishBaselineSync.Click, Async Sub() Await UpdateCloudBaselines(False)
+        AddHandler PublishBaselineUpload.Click, Async Sub() Await UpdateCloudBaselines(True)
         AddHandler PublishMaps.Click, Async Sub() Await ImportPublisherMap()
         AddHandler PublishWaypoints.Click, Async Sub() Await ImportPublisherWaypoints()
         AddHandler PublishSelectZip.Click, Sub() MarkZipBackups()
@@ -44,6 +48,8 @@ Public Class PageInstancePackPublish
             PublishFilePaths.Text = If(CStr(Saved("files")), "")
             PublishAccount.Text = CStr(Saved("account"))
             PublishBucket.Text = CStr(Saved("bucket"))
+            PublishBaselineBucket.Text = CStr(Saved("baseline_bucket"))
+            LoadBaselines(CStr(Saved("baseline_id")))
             Dim SavedRoot = CStr(Saved("root"))
             PublishRoot.Text = If(String.IsNullOrWhiteSpace(SavedRoot), ModPackUpdate.DefaultPackSource, SavedRoot)
             Dim Credentials = Publisher.ReadCredentials()
@@ -62,13 +68,25 @@ Public Class PageInstancePackPublish
             If Not String.IsNullOrEmpty(PublishedAddress) Then
                 PublishStatus.Text = "最近发布 " & CStr(Latest("release")("id")) & " · " & PublishedAddress
             Else
-                PublishStatus.Text = If(Publisher.HasBaseline, "已保存旧整合包基线。", "请扫描原始实例或导入指定文件，再保存基线。")
+                PublishStatus.Text = If(PublishBaselineChoice.SelectedItem IsNot Nothing, "请选择发布基线，再扫描此实例。", "请导入旧整合包，或扫描当前实例后保存为基线。")
             End If
         Catch ex As Exception
             PublishStatus.Text = "加载发布项目失败：" & ex.Message
         End Try
-        AddHandler PublishAccount.TextChanged, Sub() SaveStorageSettings()
+        AddHandler PublishBaselineChoice.SelectionChanged, Sub() ChangeBaseline()
+        AddHandler PackId.TextChanged, Sub()
+                                           SaveStorageSettings()
+                                           RefreshBaselineChoices()
+                                       End Sub
+        AddHandler PublishAccount.TextChanged, Sub()
+                                                   SaveStorageSettings()
+                                                   RefreshBaselineChoices()
+                                               End Sub
         AddHandler PublishBucket.TextChanged, Sub() SaveStorageSettings()
+        AddHandler PublishBaselineBucket.TextChanged, Sub()
+                                                          SaveStorageSettings()
+                                                          RefreshBaselineChoices()
+                                                      End Sub
         AddHandler PublishRoot.TextChanged, Sub() SaveStorageSettings()
         AddHandler PublishMirrorBucket.TextChanged, Sub() SaveStorageSettings()
         AddHandler PublishMirrorRoot.TextChanged, Sub() SaveStorageSettings()
@@ -95,8 +113,10 @@ Public Class PageInstancePackPublish
     End Sub
 
     Private Sub CaptureStorageSettings(Saved As JObject)
+        Saved("id") = PackId.Text.Trim()
         Saved("account") = PublishAccount.Text.Trim()
         Saved("bucket") = PublishBucket.Text.Trim()
+        Saved("baseline_bucket") = PublishBaselineBucket.Text.Trim()
         Saved("root") = PublishRoot.Text.Trim()
         Saved("sync_mirror") = PublishMirror.Checked
         Saved("mirror_bucket") = PublishMirrorBucket.Text.Trim()
@@ -141,11 +161,44 @@ Public Class PageInstancePackPublish
 
     Private Sub UpdatePublisherControls()
         PublishCard.IsEnabled = Not Busy
-        PublishBaseline.IsEnabled = Not Busy AndAlso Not Publisher.HasBaseline AndAlso DraftFiles IsNot Nothing
-        PublishNow.IsEnabled = Not Busy AndAlso Publisher.HasBaseline AndAlso DraftFiles IsNot Nothing
+        PublishBaseline.IsEnabled = Not Busy AndAlso DraftFiles IsNot Nothing
+        PublishBaselineSync.IsEnabled = Not Busy AndAlso PublishBaselineSyncAvailable()
+        PublishBaselineUpload.IsEnabled = PublishBaselineSync.IsEnabled AndAlso PublishBaselineChoice.SelectedItem IsNot Nothing
+        PublishNow.IsEnabled = Not Busy AndAlso PublishBaselineChoice.SelectedItem IsNot Nothing AndAlso DraftFiles IsNot Nothing
         PublishExport.IsEnabled = PublishNow.IsEnabled
         PublishSelectZip.IsEnabled = Not Busy AndAlso DraftFiles IsNot Nothing
         PublishCopy.IsEnabled = Not Busy AndAlso Not String.IsNullOrEmpty(PublishedAddress)
+    End Sub
+
+    Private Sub LoadBaselines(SelectedId As String)
+        Dim Scope = If(PublishBaselineSyncAvailable(),
+                       PackR2Publisher.BaselineScope(PublishAccount.Text.Trim(), PublishBaselineBucket.Text.Trim(), PackId.Text.Trim()), Nothing)
+        Dim Options = Publisher.BaselinesFor(Scope)
+        Dim Selected = If(Options.FirstOrDefault(Function(b) b.Id = SelectedId), Options.FirstOrDefault())
+        Dim Existing = TryCast(PublishBaselineChoice.ItemsSource, IEnumerable(Of PackBaseline))
+        If Existing Is Nothing OrElse Not Existing.SequenceEqual(Options) Then PublishBaselineChoice.ItemsSource = Options
+        If Not Object.Equals(Selected, PublishBaselineChoice.SelectedItem) Then PublishBaselineChoice.SelectedItem = Selected
+        UpdatePublisherControls()
+    End Sub
+
+    Private Sub RefreshBaselineChoices()
+        Dim Choice = TryCast(PublishBaselineChoice.SelectedItem, PackBaseline)
+        LoadBaselines(Choice?.Id)
+    End Sub
+
+    Private Sub ChangeBaseline()
+        InvalidateDraft()
+        Dim Choice = TryCast(PublishBaselineChoice.SelectedItem, PackBaseline)
+        If Choice Is Nothing Then Return
+        Try
+            Dim Saved = Publisher.Settings
+            Saved("baseline_id") = Choice.Id
+            Saved("id") = PackId.Text.Trim()
+            Publisher.SaveSettings(Saved)
+            PublishStatus.Text = $"已选择基线「{Choice.Name}」，请重新扫描此实例。"
+        Catch ex As Exception
+            PublishStatus.Text = "无法记住基线选择：" & ex.Message
+        End Try
     End Sub
 
     Private Sub InvalidateDraft()
@@ -153,6 +206,10 @@ Public Class PageInstancePackPublish
         PublishFiles.ItemsSource = Nothing
         UpdatePublisherControls()
     End Sub
+
+    Private Function SelectedFolders() As String()
+        Return PublishFolders.Text.Split({ChrW(13), ChrW(10), ";"c}, StringSplitOptions.RemoveEmptyEntries)
+    End Function
 
     Private Function SelectedFilePaths() As String()
         Return PublishFilePaths.Text.Split({ChrW(13), ChrW(10)}, StringSplitOptions.RemoveEmptyEntries)
@@ -174,22 +231,23 @@ Public Class PageInstancePackPublish
 
     Private Async Function ScanPublisher() As Task
         If Busy Then Return
-        Dim Folders = PublishFolders.Text.Split({ChrW(13), ChrW(10), ";"c}, StringSplitOptions.RemoveEmptyEntries)
+        Dim Folders = SelectedFolders()
         Dim Selected = SelectedFilePaths()
+        Dim Choice = TryCast(PublishBaselineChoice.SelectedItem, PackBaseline)
         SetBusy(True)
         PublishStatus.Text = "正在扫描客户端文件并匹配平台版本……"
         Try
             DraftFiles = Await Task.Run(
                 Function()
                     ModPackUpdate.CheckIdle(Target)
-                    Dim Files = Publisher.Scan(Folders, files:=Selected)
-                    If Publisher.HasBaseline Then ResolveModSources(Files)
+                    Dim Files = Publisher.Scan(Folders, compare:=Choice IsNot Nothing, files:=Selected, baselineId:=Choice?.Id)
+                    If Choice IsNot Nothing Then ResolveModSources(Files)
                     Return Files
                 End Function)
             PublishFiles.ItemsSource = DraftFiles
-            PublishStatus.Text = If(Publisher.HasBaseline,
-                $"扫描完成，共 {DraftFiles.Count} 项。请选择发布策略和可公开分发的 ZIP 备用 Mod。",
-                $"找到 {DraftFiles.Count} 项基线候选。确认这是玩家共用的旧包后，点击保存旧包基线。")
+            PublishStatus.Text = If(Choice IsNot Nothing,
+                $"已对照基线「{Choice?.Name}」扫描，共 {DraftFiles.Count} 项。请选择发布策略和可公开分发的 ZIP 备用 Mod。",
+                $"扫描完成，共 {DraftFiles.Count} 项。确认这是旧包后，可以将预览保存为基线。")
             If DraftFiles.Any(Function(f) f.Change = "已移出") Then
                 PublishStatus.Text &= vbCrLf & "此次发布使用完整文件清单。「已移出」的旧受管文件可能在玩家更新时清理。"
             End If
@@ -203,22 +261,97 @@ Public Class PageInstancePackPublish
     End Function
 
     Private Async Function RecordBaseline() As Task
-        If Busy OrElse DraftFiles Is Nothing OrElse Publisher.HasBaseline Then Return
-        PublishFiles.CommitEdit(DataGridEditingUnit.Cell, True)
-        PublishFiles.CommitEdit(DataGridEditingUnit.Row, True)
-        If MyMsgBox("将预览中的文件保存为旧版迁移基线？请选择玩家原先共用的未经修改的整合包。", "保存旧包基线", "保存", "取消") <> 1 Then Return
+        If Busy OrElse DraftFiles Is Nothing Then Return
+        If Not PublishFiles.CommitEdit(DataGridEditingUnit.Cell, True) OrElse Not PublishFiles.CommitEdit(DataGridEditingUnit.Row, True) Then Return
+        Dim Name = MyMsgBoxInput("保存预览为基线", "为当前实例的选中文件快照命名。", HintText:="例如 正式版 1.0")
+        If String.IsNullOrWhiteSpace(Name) Then Return
+        Dim Snapshot = DraftFiles
+        Await SaveBaseline(Function() Publisher.SaveBaseline(Name, Snapshot))
+    End Function
+
+    Private Async Function ImportBaseline(FromZip As Boolean) As Task
+        If Busy Then Return
+        Dim Source = If(FromZip,
+            Dialogs.SelectFile("选择完整旧整合包 ZIP", False, filter:={({"zip"}, "整合包 ZIP")}).FirstOrDefault(),
+            Dialogs.SelectFolder("选择旧实例目录（包含 mods、config 等文件夹）", False).FirstOrDefault())
+        If String.IsNullOrEmpty(Source) Then Return
+        Dim Name = MyMsgBoxInput("导入整合包基线", "为这份旧整合包命名，以便发布时选择。", HintText:="例如 测试版 A")
+        If String.IsNullOrWhiteSpace(Name) Then Return
+        Dim Folders = SelectedFolders()
+        Dim Files = SelectedFilePaths()
+        Await SaveBaseline(Function() If(FromZip, Publisher.ImportBaselineZip(Name, Source, Folders, Files),
+                                               Publisher.ImportBaselineFolder(Name, Source, Folders, Files)))
+    End Function
+
+    Private Async Function SaveBaseline(Save As Func(Of PackBaseline)) As Task
         SetBusy(True)
+        PublishStatus.Text = "正在生成基线快照……"
         Try
-            Dim Snapshot = DraftFiles
-            Await Task.Run(Sub()
-                               ModPackUpdate.CheckIdle(Target)
-                               Publisher.SaveBaseline(Snapshot)
-                           End Sub)
-            DraftFiles = Nothing
-            PublishFiles.ItemsSource = Nothing
-            PublishStatus.Text = "旧包基线已保存。调整此实例后可重新扫描或导入指定文件。"
+            Dim Baseline = Await Task.Run(Function()
+                                              ModPackUpdate.CheckIdle(Target)
+                                              Return Save()
+                                          End Function)
+            LoadBaselines(Baseline.Id)
+            If PublishBaselineSyncAvailable() Then
+                Try
+                    PublishStatus.Text = $"已在本机保存「{Baseline.Name}」，正在上传基线……"
+                    Await UploadCloudBaseline(Baseline.Id)
+                    PublishStatus.Text = $"基线「{Baseline.Name}」已保存并上传。重新扫描后即可发布。"
+                Catch ex As Exception
+                    PublishStatus.Text = $"基线「{Baseline.Name}」已保存在本机。上传失败，可用「上传所选基线」重试。{vbCrLf}{ex.Message}"
+                End Try
+            Else
+                PublishStatus.Text = $"基线「{Baseline.Name}」已保存在本机。重新扫描后即可发布。"
+            End If
         Catch ex As Exception
             PublishStatus.Text = ex.Message
+        Finally
+            SetBusy(False)
+        End Try
+    End Function
+
+    Private Function ReadBaselineStorage() As PackR2Settings
+        Dim Bucket = PublishBaselineBucket.Text.Trim()
+        If String.Equals(Bucket, PublishBucket.Text.Trim(), StringComparison.OrdinalIgnoreCase) Then
+            Throw New InvalidDataException("请使用独立的私有 R2 桶保存云端基线。")
+        End If
+        Return New PackR2Settings With {
+            .Account = PublishAccount.Text.Trim(), .Bucket = Bucket,
+            .AccessKey = PublishAccess.Text.Trim(), .SecretKey = PublishSecret.Password
+        }
+    End Function
+
+    Private Function PublishBaselineSyncAvailable() As Boolean
+        Return Not String.IsNullOrWhiteSpace(PublishBaselineBucket.Text)
+    End Function
+
+    Private Function UploadCloudBaseline(Id As String) As Task
+        Dim Settings = ReadBaselineStorage()
+        Dim IdPack = PackId.Text.Trim()
+        Dim Cloud = New PackR2Publisher(Publisher)
+        Return Task.Run(Sub() Cloud.UploadBaseline(Settings, IdPack, Id))
+    End Function
+
+    Private Async Function UpdateCloudBaselines(Upload As Boolean) As Task
+        If Busy Then Return
+        Dim Choice = TryCast(PublishBaselineChoice.SelectedItem, PackBaseline)
+        If Upload AndAlso Choice Is Nothing Then Return
+        SetBusy(True)
+        Try
+            If Upload Then
+                PublishStatus.Text = $"正在上传基线「{Choice.Name}」……"
+                Await UploadCloudBaseline(Choice.Id)
+                PublishStatus.Text = $"基线「{Choice.Name}」已上传。"
+            Else
+                Dim Settings = ReadBaselineStorage()
+                Dim IdPack = PackId.Text.Trim()
+                PublishStatus.Text = "正在同步该整合包的云端基线……"
+                Dim Count = Await Task.Run(Function() New PackR2Publisher(Publisher).SyncBaselines(Settings, IdPack))
+                LoadBaselines(Choice?.Id)
+                PublishStatus.Text = $"已同步 {Count} 份云端基线。请选择本次发布的基线，再扫描此实例。"
+            End If
+        Catch ex As Exception
+            PublishStatus.Text = If(Upload, "上传基线失败：", "同步基线失败：") & ex.Message
         Finally
             SetBusy(False)
         End Try
@@ -270,7 +403,8 @@ Public Class PageInstancePackPublish
     End Sub
 
     Private Sub SubmitPublication(ExportOnly As Boolean)
-        If Busy OrElse DraftFiles Is Nothing OrElse Not Publisher.HasBaseline Then Return
+        Dim Choice = TryCast(PublishBaselineChoice.SelectedItem, PackBaseline)
+        If Busy OrElse DraftFiles Is Nothing OrElse Choice Is Nothing Then Return
         If Not PublishFiles.CommitEdit(DataGridEditingUnit.Cell, True) OrElse Not PublishFiles.CommitEdit(DataGridEditingUnit.Row, True) Then Return
         Dim Output As String = Nothing
         If ExportOnly Then
@@ -279,6 +413,7 @@ Public Class PageInstancePackPublish
         Else
             Dim Message = If(PublishMirror.Checked, "发布到 R2 后自动同步私有 S3，并验证备用签名入口。",
                              "上传完整 ZIP 与清单并切换正式频道。")
+            Message &= vbCrLf & $"本次发布使用基线「{Choice.Name}」。"
             Dim RemovedCount = DraftFiles.Where(Function(f) f.Change = "已移出").Count()
             If RemovedCount > 0 Then Message &= vbCrLf & $"预览中有 {RemovedCount} 项「已移出」。玩家更新时可能清理这些旧受管文件。"
             If MyMsgBox(Message, "发布整合包", "发布", "取消") <> 1 Then Return
@@ -286,7 +421,7 @@ Public Class PageInstancePackPublish
         Dim PreviewFiles = DraftFiles
         Dim Info As New PackPublishDetails With {
             .PackId = PackId.Text.Trim(), .Name = PackName.Text.Trim(), .ReleaseId = PublishReleaseId.Text.Trim(),
-            .Channel = PublishChannel.Text.Trim(), .Notes = PublishNotes.Text, .AllowDowngrade = PublishDowngrade.Checked
+            .Channel = PublishChannel.Text.Trim(), .Notes = PublishNotes.Text, .AllowDowngrade = PublishDowngrade.Checked, .BaselineId = Choice.Id
         }
         Dim Settings As New PackR2Settings With {
             .Account = PublishAccount.Text.Trim(), .Bucket = PublishBucket.Text.Trim(), .PublicRoot = PublishRoot.Text.Trim(),
@@ -297,7 +432,7 @@ Public Class PageInstancePackPublish
             .AccessKey = PublishMirrorAccess.Text.Trim(), .SecretKey = PublishMirrorSecret.Password
         }, Nothing)
         Dim Persist = New JObject From {{"name", Info.Name}, {"id", Info.PackId}, {"channel", Info.Channel}, {"folders", PublishFolders.Text},
-            {"files", PublishFilePaths.Text}, {"remember_credentials", PublishRemember.Checked}}
+            {"files", PublishFilePaths.Text}, {"remember_credentials", PublishRemember.Checked}, {"baseline_id", Choice.Id}}
         CaptureStorageSettings(Persist)
         SetBusy(True)
         Dim Worker As New RedoableWorker(
