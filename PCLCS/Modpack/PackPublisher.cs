@@ -9,6 +9,7 @@ public sealed class PackPublishFile {
     public string LocalPath { get; set; } = "";
     public string Sha256 { get; set; } = "";
     public string? ModId { get; set; }
+    internal bool FabricMod { get; set; }
     public long Size { get; set; }
     public string Category { get; set; } = "file";
     public string Change { get; set; } = "";
@@ -155,9 +156,10 @@ public sealed class PackPublisher(string root) {
             if (path.StartsWith("mods/", StringComparison.OrdinalIgnoreCase) && !PackProtocol.ManagedMod(path)) return;
             bool map = IsMapPath(path);
             var info = new FileInfo(full);
+            var mod = PackProtocol.ManagedMod(path) ? ReadPrimaryMod(full) : null;
             result.Add(path, new PackPublishFile {
                 Path = path, LocalPath = full, Sha256 = PackProtocol.HashFile(full), Size = info.Length,
-                ModId = PackProtocol.ManagedMod(path) ? ReadModId(full) : null,
+                ModId = mod?.Id, FabricMod = mod?.Fabric == true,
                 Category = map ? "map" : path.Split('/')[0].ToLowerInvariant() switch {
                     "mods" => "mod", "config" or "defaultconfigs" => "config", "kubejs" or "scripts" => "script",
                     "resourcepacks" => "resourcepack", "shaderpacks" => "shaderpack", _ => "file"
@@ -226,7 +228,9 @@ public sealed class PackPublisher(string root) {
             var file = new PackPublishFile { Path = path, Sha256 = PackProtocol.HashStream(input) };
             if (PackProtocol.ManagedMod(path)) {
                 using var mod = item.Entry.Open();
-                file.ModId = ReadModId(mod);
+                var identity = ReadPrimaryMod(mod);
+                file.ModId = identity?.Id;
+                file.FabricMod = identity?.Fabric == true;
             }
             snapshot.Add(Snapshot(file));
         }
@@ -279,7 +283,9 @@ public sealed class PackPublisher(string root) {
             if (entry is not JObject file || file["path"]?.Type != JTokenType.String || file["sha256"]?.Type != JTokenType.String ||
                 !Regex.IsMatch((string)file["sha256"]!, "\\A[0-9a-f]{64}\\z") ||
                 (file["id"] != null && (file["id"]!.Type != JTokenType.String || !Regex.IsMatch((string)file["id"]!, "\\A[a-z][a-z0-9_]{1,63}\\z"))) ||
-                file.Properties().Any(p => p.Name != "path" && p.Name != "sha256" && p.Name != "id"))
+                (file["fabric_id"] != null && (file["id"] != null || file["fabric_id"]!.Type != JTokenType.String ||
+                    !Regex.IsMatch((string)file["fabric_id"]!, "\\A[a-z][a-z0-9_-]{1,63}\\z"))) ||
+                file.Properties().Any(p => p.Name != "path" && p.Name != "sha256" && p.Name != "id" && p.Name != "fabric_id"))
                 throw new InvalidDataException("基线包含无效的文件记录。");
             string path = (string)file["path"]!;
             PackProtocol.ValidateRelative(path, false);
@@ -406,7 +412,7 @@ public sealed class PackPublisher(string root) {
 
     private static JObject Snapshot(PackPublishFile file) {
         var entry = new JObject { ["path"] = file.Path, ["sha256"] = file.Sha256 };
-        if (file.ModId != null) entry["id"] = file.ModId;
+        if (file.ModId != null) entry[file.FabricMod ? "fabric_id" : "id"] = file.ModId;
         return entry;
     }
 
@@ -440,7 +446,9 @@ public sealed class PackPublisher(string root) {
                     var old = known.LastOrDefault(f => string.Equals((string?)f["path"], file.Path, StringComparison.OrdinalIgnoreCase));
                     var action = new JObject { ["path"] = file.Path, ["action"] = "delete", ["expected_sha256"] = (string?)old?["sha256"] ?? file.Sha256,
                         ["reason"] = "服主标记的本次发布操作", ["force"] = true };
-                    if ((file.ModId ?? (string?)old?["id"]) is string id) action["id"] = id;
+                    if (file.ModId is string id) action[file.FabricMod ? "fabric_id" : "id"] = id;
+                    else if (old?["fabric_id"] is JToken fabricId) action["fabric_id"] = fabricId.DeepClone();
+                    else if (old != null && PackProtocol.PrimaryForgeId(old) is string oldId) action["id"] = oldId;
                     ((JArray)manifest["actions"]!).Add(action);
                     continue;
                 }
@@ -455,7 +463,7 @@ public sealed class PackPublisher(string root) {
                 if (!embed && file.Urls.Count == 0) throw new IOException("此 Mod 无平台下载源。请确认分发许可并勾选 ZIP 备用，或排除此文件：" + file.Path);
                 var record = new JObject { ["path"] = target, ["size"] = file.Size, ["sha256"] = file.Sha256,
                     ["category"] = file.Category, ["urls"] = new JArray(file.Urls.Distinct()), ["write_policy"] = file.Operation == Preserve ? "preserve" : "unmodified" };
-                if (file.ModId != null) record["id"] = file.ModId;
+                if (file.ModId != null) record[file.FabricMod ? "fabric_id" : "id"] = file.ModId;
                 if (file.Operation == Force) record["force"] = true;
                 if (file.Operation == Disable) record["force_disabled"] = true;
                 if (file.Optional) record["optional"] = true;
@@ -552,20 +560,56 @@ public sealed class PackPublisher(string root) {
             else add(entry, path);
         }
     }
-    internal static string? ReadModId(string path) {
+    internal static (string Id, bool Fabric)? ReadPrimaryMod(string path) {
         using var input = File.OpenRead(path);
-        return ReadModId(input);
+        return ReadPrimaryMod(input);
     }
-    private static string? ReadModId(Stream input) {
+
+    private static (string Id, bool Fabric)? ReadPrimaryMod(Stream input) {
         try {
             using var zip = new ZipArchive(input);
-            var entry = zip.GetEntry("META-INF/neoforge.mods.toml") ?? zip.GetEntry("META-INF/mods.toml");
-            if (entry == null || entry.Length > 256 * 1024) return null;
-            using var reader = new StreamReader(entry.Open());
-            var mods = Regex.Matches(reader.ReadToEnd(), @"(?ms)^\s*\[\[mods\]\]\s*(?<section>.*?)(?=^\s*\[|\z)");
-            if (mods.Count != 1) return null;
-            var id = Regex.Match(mods[0].Groups["section"].Value, """(?m)^\s*modId\s*=\s*['"]([a-z][a-z0-9_]{1,63})['"]""");
-            return id.Success ? id.Groups[1].Value : null;
+            var mods = ReadForgeModSections(zip);
+            if (mods != null) return mods.Count != 0 && ReadForgeModId(mods[0]) is string id ? (id, false) : null;
+            return ReadJsonModId(zip, "fabric.mod.json", "id") is string fabricId ? (fabricId, true) : null;
         } catch (InvalidDataException) { return null; }
+    }
+
+    public static string[] ReadDeclaredModIds(string path) {
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        try {
+            using var input = File.OpenRead(path);
+            using var zip = new ZipArchive(input);
+            if (ReadForgeModSections(zip) is { } mods)
+                foreach (Match mod in mods)
+                    if (ReadForgeModId(mod) is string id) ids.Add(id);
+            if (ReadJsonModId(zip, "fabric.mod.json", "id") is string fabricId) ids.Add(fabricId);
+            if (ReadJsonModId(zip, "quilt.mod.json", "quilt_loader.id") is string quiltId) ids.Add(quiltId);
+        } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException) { }
+        return ids.ToArray();
+    }
+
+    private static string? ReadJsonModId(ZipArchive zip, string name, string key) {
+        if (ReadModMetadata(zip.GetEntry(name)) is not string metadata) return null;
+        try {
+            var token = JObject.Parse(metadata).SelectToken(key);
+            return token?.Type == JTokenType.String && token.Value<string>() is string id &&
+                Regex.IsMatch(id, @"\A[a-z][a-z0-9_-]{1,63}\z") ? id : null;
+        } catch (Newtonsoft.Json.JsonException) { return null; }
+    }
+
+    private static string? ReadModMetadata(ZipArchiveEntry? entry) {
+        if (entry == null || entry.Length > 256 * 1024) return null;
+        using var reader = new StreamReader(entry.Open());
+        return reader.ReadToEnd();
+    }
+
+    private static MatchCollection? ReadForgeModSections(ZipArchive zip) {
+        string? metadata = ReadModMetadata(zip.GetEntry("META-INF/neoforge.mods.toml") ?? zip.GetEntry("META-INF/mods.toml"));
+        return metadata == null ? null : Regex.Matches(metadata, @"(?ms)^\s*\[\[mods\]\]\s*(?<section>.*?)(?=^\s*\[|\z)");
+    }
+
+    private static string? ReadForgeModId(Match mod) {
+        var id = Regex.Match(mod.Groups["section"].Value, """(?m)^\s*modId\s*=\s*['"]([a-z][a-z0-9_]{1,63})['"]""");
+        return id.Success ? id.Groups[1].Value : null;
     }
 }

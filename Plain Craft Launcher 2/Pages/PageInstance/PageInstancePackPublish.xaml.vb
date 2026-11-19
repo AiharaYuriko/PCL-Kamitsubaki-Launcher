@@ -474,9 +474,9 @@ Public Class PageInstancePackPublish
         End If
     End Sub
 
-    Private Shared Sub ResolveModSources(Files As IEnumerable(Of PackPublishFile))
+    Friend Shared Sub ResolveModSources(Files As IEnumerable(Of PackPublishFile))
         Dim Mods = Files.Where(Function(f) f.Category = "mod" AndAlso f.LocalPath.Length > 0).
-            Select(Function(f) (Entry:=f, Local:=New LocalResourceFile(f.LocalPath))).ToList()
+            Select(Function(f) (Entry:=f, Local:=New LocalResourceFile(f.LocalPath, UseHashCache:=False))).ToList()
         For Start As Integer = 0 To Mods.Count - 1 Step 80
             Dim Batch = Mods.Skip(Start).Take(80).ToList()
             Try
@@ -489,14 +489,14 @@ Public Class PageInstancePackPublish
                     If File IsNot Nothing Then AddPublisherSource(Entry.Entry, "modrinth", CStr(V("project_id")), CStr(V("id")), CStr(File("url")))
                 Next
             Catch ex As Exception
-                Logger.Warn(ex, "发布预览获取 Modrinth 文件信息失败")
+                Logger.Warn(ex, "获取 Modrinth 文件信息失败")
             End Try
             Try
                 Dim Query = New JObject From {{"fingerprints", New JArray(Batch.Select(Function(m) m.Local.CurseForgeHash).Distinct())}}
                 Dim Matches = DlModRequest("https://api.curseforge.com/v1/fingerprints/432", HttpMethod.Post, Query.ToString(), "application/json")("data")("exactMatches")
                 For Each Match In Matches
                     Dim File = Match("file")
-                    If File Is Nothing OrElse String.IsNullOrWhiteSpace(CStr(File("downloadUrl"))) Then Continue For
+                    If File Is Nothing Then Continue For
                     For Each Entry In Batch.Where(Function(m) m.Local.CurseForgeHash = CUInt(File("fileFingerprint")) AndAlso m.Entry.Size = CLng(File("fileLength")))
                         If File("hashes") Is Nothing OrElse Not File("hashes").Any(Function(h) CInt(h("algo")) = 1 AndAlso
                               String.Equals(CStr(h("value")), Entry.Local.ModrinthHash, StringComparison.OrdinalIgnoreCase)) Then Continue For
@@ -504,7 +504,7 @@ Public Class PageInstancePackPublish
                     Next
                 Next
             Catch ex As Exception
-                Logger.Warn(ex, "发布预览获取 CurseForge 文件信息失败")
+                Logger.Warn(ex, "获取 CurseForge 文件信息失败")
             End Try
         Next
         For Each Entry In Mods
@@ -513,8 +513,10 @@ Public Class PageInstancePackPublish
     End Sub
 
     Private Shared Sub AddPublisherSource(Entry As PackPublishFile, Platform As String, Project As String, Version As String, Address As String)
-        PackProtocol.Https(Address)
-        If Not Entry.Urls.Contains(Address) Then Entry.Urls.Add(Address)
+        If Not String.IsNullOrWhiteSpace(Address) Then
+            PackProtocol.Https(Address)
+            If Not Entry.Urls.Contains(Address) Then Entry.Urls.Add(Address)
+        End If
         Entry.Sources.Add(New JObject From {{"platform", Platform}, {"project", Project}, {"version", Version}})
     End Sub
 End Class

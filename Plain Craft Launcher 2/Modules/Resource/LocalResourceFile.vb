@@ -9,11 +9,14 @@ Public Class LocalResourceFile
     ''' 该文件的文件信息。
     ''' </summary>
     Public ReadOnly File As FileInfo
-    Public Sub New(FileInfo As FileInfo)
+    Private ReadOnly UseHashCache As Boolean
+    Public ModIds As String() = Array.Empty(Of String)()
+    Public Sub New(FileInfo As FileInfo, Optional UseHashCache As Boolean = True)
         Me.File = FileInfo
+        Me.UseHashCache = UseHashCache
     End Sub
-    Public Sub New(FullName As String)
-        Me.New(FileUtils.GetInfo(FullName))
+    Public Sub New(FullName As String, Optional UseHashCache As Boolean = True)
+        Me.New(FileUtils.GetInfo(FullName), UseHashCache)
     End Sub
 
     ''' <summary>
@@ -190,7 +193,7 @@ Public Class LocalResourceFile
             If _CurseForgeHash Is Nothing Then
                 '读取缓存
                 Dim CacheKey As String = $"{EnabledFullName}-{File.LastWriteTime.ToLongTimeString}-{File.Length}-C".GetStableHashCode()
-                Dim Cached As String = ReadIni(PathTemp & "Cache\ModHash.ini", CacheKey)
+                Dim Cached As String = If(UseHashCache, ReadIni(PathTemp & "Cache\ModHash.ini", CacheKey), "")
                 If Cached <> "" AndAlso Cached.RegexCheck("^\d+$") Then '#5062
                     _CurseForgeHash = Cached
                     Return _CurseForgeHash
@@ -230,7 +233,7 @@ Public Class LocalResourceFile
                 h = h Xor (h >> 15)
                 _CurseForgeHash = h
                 '写入缓存
-                WriteIni(PathTemp & "Cache\ModHash.ini", CacheKey, h.ToString)
+                If UseHashCache Then WriteIni(PathTemp & "Cache\ModHash.ini", CacheKey, h.ToString)
             End If
             Return _CurseForgeHash
         End Get
@@ -245,7 +248,7 @@ Public Class LocalResourceFile
             If _ModrinthHash Is Nothing Then
                 '读取缓存
                 Dim CacheKey As String = $"{EnabledFullName}-{File.LastWriteTime.ToLongTimeString}-{File.Length}-M".GetStableHashCode()
-                Dim Cached As String = ReadIni(PathTemp & "Cache\ModHash.ini", CacheKey)
+                Dim Cached As String = If(UseHashCache, ReadIni(PathTemp & "Cache\ModHash.ini", CacheKey), "")
                 If Cached <> "" Then
                     _ModrinthHash = Cached
                     Return _ModrinthHash
@@ -253,7 +256,7 @@ Public Class LocalResourceFile
                 '计算 SHA1
                 _ModrinthHash = CryptographyUtils.ComputeFileHash(File.FullName, CryptographyUtils.HashMethod.Sha1)
                 '写入缓存
-                WriteIni(PathTemp & "Cache\ModHash.ini", CacheKey, _ModrinthHash)
+                If UseHashCache Then WriteIni(PathTemp & "Cache\ModHash.ini", CacheKey, _ModrinthHash)
             End If
             Return _ModrinthHash
         End Get

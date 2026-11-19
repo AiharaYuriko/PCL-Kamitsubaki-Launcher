@@ -43,6 +43,27 @@ internal static partial class Program {
             onRange?.Invoke(length);
         };
     static void Main() {
+        Test("read local mod IDs without relying on filenames or online projects", root => {
+            void Check(string name, string[] expected, params (string Entry, string Text)[] entries) {
+                string path = Path.Combine(root, name);
+                using (var zip = new ZipArchive(File.Create(path), ZipArchiveMode.Create)) {
+                    foreach (var entry in entries) {
+                        using var writer = new StreamWriter(zip.CreateEntry(entry.Entry).Open());
+                        writer.Write(entry.Text);
+                    }
+                }
+                Assert(expected.SequenceEqual(PackPublisher.ReadDeclaredModIds(path).OrderBy(id => id, StringComparer.Ordinal)), name);
+            }
+
+            const string creativeCore = "[[mods]]\nmodId=\"creativecore\"\n[[dependencies.creativecore]]\nmodId=\"neoforge\"";
+            Check("renamed.jar", new[] { "creativecore" }, ("META-INF/neoforge.mods.toml", creativeCore));
+            Check("original.jar.disabled", new[] { "creativecore", "second_mod" },
+                ("META-INF/mods.toml", creativeCore + "\n[[mods]]\nmodId='second_mod'"),
+                ("fabric.mod.json", """{"id":"creativecore"}"""));
+            Check("other.jar", new[] { "quilt-mod" }, ("fabric.mod.json", "{invalid"), ("quilt.mod.json", """{"quilt_loader":{"id":"quilt-mod"}}"""));
+            Write(root, "not-an-archive.jar", "invalid");
+            Assert(PackPublisher.ReadDeclaredModIds(Path.Combine(root, "not-an-archive.jar")).Length == 0, "bad archive should not block the list");
+        });
         TestArchiveLinks();
         TestMultipartUpload();
         Test("official update source has its own default mirror and explicit disable is saved", root => {
@@ -416,35 +437,139 @@ internal static partial class Program {
             document["files"]![0]!["path"] = "saves/world";
             Throws(() => publisher.CacheCloudBaseline(document, scope, Hash(document)));
         });
-        Test("renamed mod is previewed together and only a verified duplicate is removed", root => {
-            string author = Path.Combine(root, "author"), player = Path.Combine(root, "player");
-            Write(author, "mods/a-1.jar", "old");
+        Test("updates a Mod by ID and keeps the exact published custom JAR", root => {
+            string author = Path.Combine(root, "author"), older = Path.Combine(root, "older.jar"), zip = Path.Combine(root, "pack.zip");
+            void ModJar(string path, string id, string version, string body) {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                using var jar = new ZipArchive(File.Create(path), ZipArchiveMode.Create);
+                using (var metadata = new StreamWriter(jar.CreateEntry("META-INF/neoforge.mods.toml").Open()))
+                    metadata.Write($"[[mods]]\nmodId=\"{id}\"\nversion=\"{version}\"\n");
+                using var contents = new StreamWriter(jar.CreateEntry("custom.txt").Open());
+                contents.Write(body);
+            }
+            const string first = "mods/a-1.jar", baselinePath = "mods/a-2.jar", target = "mods/a-3.jar";
+            string baselineFile = Path.Combine(author, baselinePath);
+            string baselineCopy = Path.Combine(root, "baseline.jar");
+            ModJar(older, "example", "1", "old");
+            ModJar(baselineFile, "example", "2", "baseline");
+            File.Copy(baselineFile, baselineCopy);
             var publisher = new PackPublisher(author);
-            var baseline = publisher.Scan(PackPublisher.DefaultFolders);
-            baseline.Single().ModId = "example";
-            publisher.SaveBaseline(baseline);
-            System.IO.File.Delete(Path.Combine(author, "mods/a-1.jar"));
-            Write(author, "mods/a-2.jar", "new");
+            publisher.SaveBaseline(publisher.Scan(PackPublisher.DefaultFolders));
+            File.Delete(baselineFile);
+            string published = Path.Combine(author, target);
+            ModJar(published, "example", "3", "publisher modifications");
             var files = publisher.Scan(PackPublisher.DefaultFolders);
-            var newer = files.Single(f => f.Path == "mods/a-2.jar");
-            newer.ModId = "example";
-            newer.EmbedMod = true;
-            var release = publisher.Build(Details(), files, 1, Path.Combine(root, "pack.zip"), "https://example.com");
+            files.Single(file => file.Path == target).EmbedMod = true;
+            var release = publisher.Build(Details(), files, 1, zip, "https://example.com");
+            Assert((string?)release["files"]![0]!["id"] == "example", "Published custom Mod ID was missing");
+            foreach (var (name, hasBaseline, hasTarget, matchingTarget) in new[] {
+                ("p1", false, false, false), ("p2", true, false, false),
+                ("p3", true, true, true), ("p4", true, true, false)
+            }) {
+                string player = Path.Combine(root, name);
+                Directory.CreateDirectory(Path.Combine(player, "mods"));
+                File.Copy(older, Path.Combine(player, first));
+                if (hasBaseline) File.Copy(baselineCopy, Path.Combine(player, baselinePath));
+                if (matchingTarget) File.Copy(published, Path.Combine(player, target));
+                else if (hasTarget) ModJar(Path.Combine(player, target), "example", "3", "different build with same version");
+                Write(player, "mods/unknown.jar", "unrecognized file");
+                var updater = new PackUpdater(player);
+                var plan = updater.Plan(release, Array.Empty<string>());
+                Assert((plan.Bytes == 0) == matchingTarget, "Plan should download only when the target hash differs");
+                var deletionPaths = plan.Changes.Where(change => change.Kind == "删除旧版本").Select(change => change.Path).ToList();
+                Assert(deletionPaths.Contains(first) && deletionPaths.Contains(baselinePath) == hasBaseline, "Wrong cleanup preview");
+                updater.Apply(plan, () => new PackRuntime(), _ => { }, options: new PackDownloadOptions { DownloadRange = LocalRanges(zip) });
+                Assert(!File.Exists(Path.Combine(player, first)) && !File.Exists(Path.Combine(player, baselinePath)), "Old Mod copy survived");
+                Assert(PackProtocol.HashFile(Path.Combine(player, target)) == PackProtocol.HashFile(published), "Published custom JAR was not applied");
+                Assert(File.Exists(Path.Combine(player, "mods/unknown.jar")), "File without a recognizable ID was removed");
+            }
+        });
+        Test("uses only the outer primary ID to replace a bundled Mod", root => {
+            const string target = "mods/bundle.jar", oldBundle = "mods/old-bundle.jar", standalone = "mods/example-extra.jar";
+            string author = Path.Combine(root, "a"), player = Path.Combine(root, "p"), zip = Path.Combine(root, "pack.zip");
+            void Jar(string folder, string path, string version, params string[] ids) {
+                string full = Path.Combine(folder, path);
+                Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+                using var jar = new ZipArchive(File.Create(full), ZipArchiveMode.Create);
+                using var metadata = new StreamWriter(jar.CreateEntry("META-INF/neoforge.mods.toml").Open());
+                foreach (string id in ids) metadata.Write($"[[mods]]\nmodId=\"{id}\"\nversion=\"{version}\"\n");
+            }
+            Jar(player, oldBundle, "2", "example", "old_extra");
+            Jar(player, standalone, "4", "example_extra");
+            Jar(player, "mods/unrelated.jar", "1", "unrelated", "example");
+            var publisher = new PackPublisher(author);
+            Directory.CreateDirectory(Path.Combine(author, "mods"));
+            File.Copy(Path.Combine(player, oldBundle), Path.Combine(author, oldBundle));
+            publisher.SaveBaseline(publisher.Scan(PackPublisher.DefaultFolders));
+            File.Delete(Path.Combine(author, oldBundle));
+            Jar(author, target, "3", "example", "example_extra");
+            var files = publisher.Scan(PackPublisher.DefaultFolders);
+            files.Single(file => file.Path == target).EmbedMod = true;
+            var release = publisher.Build(Details(), files, 1, zip, "https://example.com");
+            Assert((string?)release["files"]![0]!["id"] == "example" && release["files"]![0]!["ids"] == null, "Release should record only the outer primary ID");
             var updater = new PackUpdater(player);
-            Write(player, "mods/a-1.jar", "old");
-            var upgrade = updater.Plan(release, Array.Empty<string>());
-            var preview = upgrade.PreviewChanges().Single();
-            Assert(upgrade.Changes.Count == 2 && preview.Change.Path == "mods/a-2.jar" &&
-                preview.PreviousPaths.SequenceEqual(new[] { "mods/a-1.jar" }), "Renamed upgrade should be previewed as one Mod row");
-            Write(player, "mods/a-2.jar", "new");
-            Write(player, "mods/a-1.jar", "player");
-            Throws(() => updater.Plan(release, Array.Empty<string>()));
-            Write(player, "mods/a-1.jar", "old");
             var plan = updater.Plan(release, Array.Empty<string>());
-            Assert(plan.Changes.Single().Path == "mods/a-1.jar" && plan.Bytes == 0, "Incorrect duplicate cleanup preview");
-            Assert(plan.PreviewChanges().Single().Change.Kind == "删除旧版本", "Standalone duplicate cleanup should remain visible");
-            updater.Apply(plan, () => new PackRuntime(), _ => { });
-            Assert(!System.IO.File.Exists(Path.Combine(player, "mods/a-1.jar")) && System.IO.File.ReadAllText(Path.Combine(player, "mods/a-2.jar")) == "new", "Duplicate mod survived");
+            Assert(plan.PreviewChanges().Single().PreviousPaths.SequenceEqual(new[] { oldBundle }), "Bundle preview should only remove the previous bundle");
+            updater.Apply(plan, () => new PackRuntime(), _ => { }, options: new PackDownloadOptions { DownloadRange = LocalRanges(zip) });
+            Assert(File.Exists(Path.Combine(player, target)) && !File.Exists(Path.Combine(player, oldBundle)) &&
+                File.Exists(Path.Combine(player, standalone)) && File.Exists(Path.Combine(player, "mods/unrelated.jar")), "Wrong JARs after bundle installation");
+            updater.Rollback();
+            Assert(File.Exists(Path.Combine(player, oldBundle)) && File.Exists(Path.Combine(player, standalone)), "Rollback lost a replaced JAR");
+
+            var legacyBundleRelease = (JObject)release.DeepClone();
+            var targetFile = (JObject)legacyBundleRelease["files"]![0]!;
+            targetFile.Remove("id");
+            targetFile["ids"] = new JArray("example", "example_extra");
+            Assert(updater.Plan(legacyBundleRelease, Array.Empty<string>()).PreviewChanges().Single().PreviousPaths.SequenceEqual(new[] { oldBundle }),
+                "Legacy bundle records should use their first ID");
+            ((JArray)release["actions"]!).Add(new JObject {
+                ["path"] = "mods/requested-extra.jar", ["action"] = "delete", ["force"] = true, ["id"] = "example_extra",
+                ["expected_sha256"] = PackProtocol.HashFile(Path.Combine(player, standalone)), ["reason"] = "Remove standalone copy"
+            });
+            Assert(updater.Plan(release, Array.Empty<string>()).Changes.Single(change => change.Kind == "强制删除").Path == standalone,
+                "Explicit force deletion should resolve the standalone ID without claiming the bundle");
+        });
+        Test("distinguishes Fabric IDs and resolves metadata-free Mods by platform fingerprints", root => {
+            const string fabric = "mods/fabric-2.jar.disabled", oldFabric = "mods/fabric-1.jar.disabled";
+            const string platform = "mods/library-2.jar", oldPlatform = "mods/renamed-library.jar";
+            string author = Path.Combine(root, "a"), player = Path.Combine(root, "p"), zip = Path.Combine(root, "pack.zip");
+            void Jar(string folder, string path, string metadata, string content) {
+                string full = Path.Combine(folder, path);
+                Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+                using var jar = new ZipArchive(File.Create(full), ZipArchiveMode.Create);
+                using var writer = new StreamWriter(jar.CreateEntry(metadata).Open());
+                writer.Write(content);
+            }
+            Jar(author, oldFabric, "fabric.mod.json", """{"schemaVersion":1,"id":"shared_mod","version":"1"}""");
+            Directory.CreateDirectory(Path.Combine(player, "mods"));
+            File.Copy(Path.Combine(author, oldFabric), Path.Combine(player, oldFabric));
+            Write(author, "mods/library-1.jar", "known baseline library");
+            var publisher = new PackPublisher(author);
+            publisher.SaveBaseline(publisher.Scan(PackPublisher.DefaultFolders));
+            File.Delete(Path.Combine(author, oldFabric));
+            File.Delete(Path.Combine(author, "mods/library-1.jar"));
+            Jar(author, fabric, "fabric.mod.json", """{"schemaVersion":1,"id":"shared_mod","version":"2"}""");
+            Jar(player, "mods/forge.jar", "META-INF/neoforge.mods.toml", "[[mods]]\nmodId=\"shared_mod\"");
+            Write(author, platform, "published library");
+            Write(player, oldPlatform, "another platform version");
+            Write(player, "mods/unknown.jar", "unrecognized file");
+            JObject Source() => new() { ["platform"] = "modrinth", ["project"] = "Library1", ["version"] = "Version1" };
+            var files = publisher.Scan(PackPublisher.DefaultFolders);
+            foreach (var file in files.Where(file => file.LocalPath.Length != 0)) file.EmbedMod = true;
+            files.Single(file => file.Path == platform).Sources.Add(Source());
+            var release = publisher.Build(Details(), files, 1, zip, "https://example.com");
+            Assert(release["files"]!.Any(file => (string?)file["path"] == fabric && (string?)file["fabric_id"] == "shared_mod"), "Fabric ID missing from release");
+            int lookups = 0;
+            var updater = new PackUpdater(player, candidates => {
+                lookups++;
+                foreach (var candidate in candidates.Where(file => file.Path == oldPlatform)) candidate.Sources.Add(Source());
+            });
+            var plan = updater.Plan(release, Array.Empty<string>());
+            Assert(plan.PreviewChanges().Single(row => row.Change.Path == platform).PreviousPaths.SequenceEqual(new[] { oldPlatform }), "Platform fallback missed renamed file");
+            updater.Apply(plan, () => new PackRuntime(), _ => { }, options: new PackDownloadOptions { DownloadRange = LocalRanges(zip) });
+            Assert(lookups == 1 && File.Exists(Path.Combine(player, fabric)) && !File.Exists(Path.Combine(player, oldFabric)) &&
+                !File.Exists(Path.Combine(player, oldPlatform)) && File.Exists(Path.Combine(player, "mods/forge.jar")) &&
+                File.Exists(Path.Combine(player, "mods/unknown.jar")), "Incorrect layered identification or preview lookup reuse");
         });
         Test("skipped optional upgrade remains managed until next release", root => {
             string author = Path.Combine(root, "author"), player = Path.Combine(root, "player"), zip = Path.Combine(root, "pack.zip");

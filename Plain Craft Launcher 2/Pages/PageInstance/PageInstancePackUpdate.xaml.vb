@@ -24,7 +24,7 @@ Public Class PageInstancePackUpdate
     Public Sub New(Instance As McInstance)
         InitializeComponent()
         Target = Instance
-        Updater = New PackUpdater(Instance.PathVersion)
+        Updater = New PackUpdater(Instance.PathVersion, AddressOf PageInstancePackPublish.ResolveModSources)
         Dim Binding = Updater.Binding
         Dim SavedSource = CStr(Binding("source"))
         Source.Text = If(String.IsNullOrWhiteSpace(SavedSource), ModPackUpdate.DefaultPackSource, SavedSource)
@@ -154,7 +154,7 @@ Public Class PageInstancePackUpdate
                 Dim Change = Row.Change
                 If Change.IsMod Then
                     Dim Name = If(Change.Name.StartsWith("mods/", StringComparison.OrdinalIgnoreCase),
-                        If(CStr(Change.File?("id")), System.IO.Path.GetFileName(Change.Path)), Change.Name)
+                        If(CStr(Change.File?("id")), CStr(Change.File?("fabric_id")), System.IO.Path.GetFileName(Change.Path)), Change.Name)
                     Dim Kind = If(Row.PreviousPaths.Length > 0 AndAlso Change.Kind = "新增", "更新", Change.Kind)
                     Dim Paths = String.Join("、", Row.PreviousPaths)
                     Dim Info = If(Paths = "", Change.Path, Paths & " → " & Change.Path)
@@ -180,7 +180,7 @@ Public Class PageInstancePackUpdate
                 Status.Text &= vbCrLf & "首次绑定：保留未识别的额外文件。"
             End If
             If Not Preview.IsApplied Then Status.Text &= vbCrLf & If(Archived,
-                "点击更新将应用本次发布操作。列表中的本地内容会保留。",
+                "点击更新将按预览安装、替换或移除文件。",
                 "点击更新将应用以上变化；受管文件会替换，额外文件保留。")
             Update.Text = If(Preview.IsApplied, "已应用此版本", If(Preview.Changes.Count = 0 AndAlso Not Archived, "更新 / 检查修复", "更新整合包"))
         Catch ex As Exception

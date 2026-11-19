@@ -66,16 +66,7 @@ Public Module LocalResourceLoaders
             For Each ModFile In ModFileList
                 If Loader.IsCanceled Then Return
                 Dim ModEntry As New LocalResourceFile(ModFile)
-                Dim DumpMod As LocalResourceFile = ModList.FirstOrDefault(Function(m) m.EnabledName = ModEntry.EnabledName) '存在两个文件，名称相同，但一个启用一个禁用
-                If DumpMod IsNot Nothing Then
-                    Dim DisabledMod As LocalResourceFile = If(DumpMod.IsEnabled, ModEntry, DumpMod)
-                    Logger.Warn($"重复的 Mod 文件：{DumpMod.File.Name} 与 {ModEntry.File.Name}，已忽略 {DisabledMod.File.Name}")
-                    If DisabledMod Is ModEntry Then
-                        Continue For
-                    Else
-                        ModList.Remove(DisabledMod)
-                    End If
-                End If
+                ModEntry.ModIds = PCL.Modpack.PackPublisher.ReadDeclaredModIds(ModFile)
                 ModList.Add(ModEntry)
             Next
             Logger.Info($"共发现 {ModList.Count} 个 Mod")

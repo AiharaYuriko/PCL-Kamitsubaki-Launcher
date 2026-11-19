@@ -67,7 +67,7 @@ Public Class PageInstanceMod
 #Region "UI 化"
 
     ''' <summary>
-    ''' 已加载的 Mod UI 缓存，不确保按显示顺序排列。Key 为 Mod 的 RawFileName。
+    ''' 已加载的 Mod UI 缓存，不确保按显示顺序排列。Key 为 Mod 的实际完整路径。
     ''' </summary>
     Public ModItems As New ConcurrentDictionary(Of String, MyLocalModItem)
     ''' <summary>
@@ -87,7 +87,7 @@ Public Class PageInstanceMod
             '修改缓存
             ModItems.Clear()
             For Each ModEntity As LocalResourceFile In LocalResourceLoader.Output
-                ModItems(ModEntity.EnabledName) = McModListItem(ModEntity)
+                ModItems(ModEntity.File.FullName) = McModListItem(ModEntity)
             Next
             '显示结果
             Filter = FilterType.All
@@ -100,7 +100,8 @@ Public Class PageInstanceMod
     Private Function McModListItem(Entry As LocalResourceFile) As MyLocalModItem
         AniControlEnabled += 1
         Dim NewItem As New MyLocalModItem With {.SnapsToDevicePixels = True, .Entry = Entry,
-            .ButtonHandler = AddressOf McModContent, .Checked = SelectedMods.Contains(Entry.EnabledName)}
+            .ButtonHandler = AddressOf McModContent, .Checked = SelectedMods.Contains(Entry.File.FullName),
+            .ToolTip = Entry.File.Name & If(Entry.ModIds.Length = 0, "", vbCrLf & "Mod ID：" & String.Join("、", Entry.ModIds))}
         AddHandler Entry.OnUpdate, Sub() RunInUi(AddressOf NewItem.Refresh)
         AniControlEnabled -= 1
         Return NewItem
@@ -131,7 +132,14 @@ Public Class PageInstanceMod
     ''' </summary>
     Public Sub RefreshUI()
         If PanList Is Nothing Then Return
-        Dim ShowingMods = If(IsSearching, SearchResult, If(LocalResourceLoader.Output, New List(Of LocalResourceFile))).Where(Function(m) CanPassFilter(m)).ToList
+        Dim AllMods = If(LocalResourceLoader.Output, New List(Of LocalResourceFile))
+        Dim Source = If(IsSearching AndAlso SearchResult IsNot Nothing, SearchResult, AllMods)
+        Dim DuplicateIds As New HashSet(Of String)(
+            AllMods.SelectMany(Function(ModEntry) ModEntry.ModIds).GroupBy(Function(Id) Id, StringComparer.Ordinal).
+                Where(Function(Group) Group.Skip(1).Any()).Select(Function(Group) Group.Key), StringComparer.Ordinal)
+        Dim DuplicateMods = Source.Where(Function(ModEntry) ModEntry.ModIds.Any(AddressOf DuplicateIds.Contains)).ToList()
+        DuplicateCount = DuplicateMods.Count
+        Dim ShowingMods = If(Filter = FilterType.Duplicate, DuplicateMods, Source.Where(AddressOf CanPassFilter).ToList())
         '重新列出列表
         AniControlEnabled += 1
         If ShowingMods.Any() Then
@@ -139,15 +147,15 @@ Public Class PageInstanceMod
             PanList.Children.Clear()
             For Each TargetMod In ShowingMods
                 Dim Item As MyLocalModItem = Nothing
-                If Not ModItems.TryGetValue(TargetMod.EnabledName, Item) Then Continue For
-                Item.Checked = SelectedMods.Contains(TargetMod.EnabledName) '更新选中状态
+                If Not ModItems.TryGetValue(TargetMod.File.FullName, Item) Then Continue For
+                Item.Checked = SelectedMods.Contains(TargetMod.File.FullName) '更新选中状态
                 PanList.Children.Add(Item)
             Next
         Else
             PanList.Visibility = Visibility.Collapsed
         End If
         AniControlEnabled -= 1
-        SelectedMods = SelectedMods.Where(Function(m) ShowingMods.Any(Function(s) s.EnabledName = m)).ToList '取消选中已经不显示的 Mod
+        SelectedMods = SelectedMods.Where(Function(m) ShowingMods.Any(Function(s) s.File.FullName = m)).ToList '取消选中已经不显示的 Mod
         RefreshBars()
     End Sub
 
@@ -178,6 +186,8 @@ Public Class PageInstanceMod
         BtnFilterEnabled.Visibility = If(Filter = FilterType.Enabled OrElse (EnabledCount > 0 AndAlso EnabledCount < AnyCount), Visibility.Visible, Visibility.Collapsed)
         BtnFilterDisabled.Text = $"禁用 ({DisabledCount})"
         BtnFilterDisabled.Visibility = If(Filter = FilterType.Disabled OrElse DisabledCount > 0, Visibility.Visible, Visibility.Collapsed)
+        BtnFilterDuplicate.Text = $"重复 Mod ({DuplicateCount})"
+        BtnFilterDuplicate.Visibility = If(Filter = FilterType.Duplicate OrElse DuplicateCount > 0, Visibility.Visible, Visibility.Collapsed)
 
         '-----------------
         ' 底部栏
@@ -193,7 +203,7 @@ Public Class PageInstanceMod
             Dim HasEnabled As Boolean = False
             Dim HasDisabled As Boolean = False
             For Each ModEntity In LocalResourceLoader.Output
-                If Not SelectedMods.Contains(ModEntity.EnabledName) Then Continue For
+                If Not SelectedMods.Contains(ModEntity.File.FullName) Then Continue For
                 If ModEntity.HasUpdate Then HasUpdate = True
                 If ModEntity.IsEnabled Then HasEnabled = True
                 If Not ModEntity.IsEnabled Then HasDisabled = True
@@ -344,14 +354,14 @@ Install:
 
 #Region "选择"
 
-    '选择的 Mod 的路径（不含 .disabled 和 .old）
+    '选择的 Mod 的实际完整路径
     Public SelectedMods As New List(Of String)
 
     '单项切换选择状态
     Public Sub CheckChanged(sender As MyLocalModItem, e As RouteEventArgs)
         If AniControlEnabled <> 0 Then Return
         '更新选择了的内容
-        Dim SelectedKey As String = sender.Entry.EnabledName
+        Dim SelectedKey As String = sender.Entry.File.FullName
         If sender.Checked Then
             If Not SelectedMods.Contains(SelectedKey) Then SelectedMods.Add(SelectedKey)
         Else
@@ -368,7 +378,7 @@ Install:
             '#4992，Mod 从过滤器看可能不应在列表中，但因为刚切换状态所以依然保留在列表中，所以应该从列表 UI 判断，而非从过滤器判断
             Dim ShouldSelected As Boolean = Value AndAlso PanList.Children.Contains(Item)
             Item.Checked = ShouldSelected
-            If ShouldSelected Then SelectedMods.Add(Item.Entry.EnabledName)
+            If ShouldSelected Then SelectedMods.Add(Item.Entry.File.FullName)
         Next
         AniControlEnabled -= 1
         RefreshBars()
@@ -394,6 +404,7 @@ Install:
 #Region "筛选"
 
     Private _Filter As FilterType = FilterType.All
+    Private DuplicateCount As Integer
     Public Property Filter As FilterType
         Get
             Return _Filter
@@ -408,6 +419,8 @@ Install:
                     BtnFilterEnabled.Checked = True
                 Case FilterType.Disabled
                     BtnFilterDisabled.Checked = True
+                Case FilterType.Duplicate
+                    BtnFilterDuplicate.Checked = True
                 Case Else
                     BtnFilterCanUpdate.Checked = True
             End Select
@@ -419,6 +432,7 @@ Install:
         Enabled = 1
         Disabled = 2
         CanUpdate = 3
+        Duplicate = 4
     End Enum
 
     ''' <summary>
@@ -440,9 +454,8 @@ Install:
     End Function
 
     '点击筛选项触发的改变
-    Private Sub ChangeFilter(sender As MyRadioButton, raiseByMouse As Boolean) Handles BtnFilterAll.Check, BtnFilterCanUpdate.Check, BtnFilterDisabled.Check, BtnFilterEnabled.Check
+    Private Sub ChangeFilter(sender As MyRadioButton, raiseByMouse As Boolean) Handles BtnFilterAll.Check, BtnFilterCanUpdate.Check, BtnFilterDisabled.Check, BtnFilterEnabled.Check, BtnFilterDuplicate.Check
         Filter = sender.Tag
-        RefreshUI()
     End Sub
 
 #End Region
@@ -451,7 +464,7 @@ Install:
 
     '启用 / 禁用
     Private Sub BtnSelectED_Click(sender As MyIconTextButton, e As RouteEventArgs) Handles BtnSelectEnable.Click, BtnSelectDisable.Click
-        EDMods(LocalResourceLoader.Output.Where(Function(m) SelectedMods.Contains(m.EnabledName)),
+        EDMods(LocalResourceLoader.Output.Where(Function(m) SelectedMods.Contains(m.File.FullName)),
                Not sender.Equals(BtnSelectDisable))
         ChangeAllSelected(False)
     End Sub
@@ -473,16 +486,11 @@ Install:
             Try
                 If FileUtils.Exists(NewPath) Then
                     If FileUtils.Exists(ModEntity.File.FullName) Then
-                        '同时存在两个名称的 Mod
-                        If CryptographyUtils.ComputeFileHash(ModEntity.File.FullName) <> CryptographyUtils.ComputeFileHash(NewPath) Then
-                            MyMsgBox($"目前同时存在启用和禁用的两个 Mod 文件：{vbCrLf} - {PathUtils.GetLastPart(NewPath)}{vbCrLf} - {ModEntity.File.Name}{vbCrLf}{vbCrLf}注意，这两个文件的内容并不相同。{vbCrLf}在手动删除或重命名其中一个文件后，才能继续操作。", "存在文件冲突")
-                            Continue For
-                        End If
+                        MyMsgBox($"目标文件已存在：{vbCrLf} - {PathUtils.GetLastPart(NewPath)}{vbCrLf} - {ModEntity.File.Name}{vbCrLf}{vbCrLf}请先移除或重命名其中一个文件，再切换状态。", "存在文件冲突")
                     Else
-                        '已经重命名过了
                         Logger.Warn("Mod 的状态已被切换")
-                        Continue For
                     End If
+                    Continue For
                 End If
                 FileUtils.Move(ModEntity.File.FullName, NewPath)
             Catch ex As FileNotFoundException
@@ -492,10 +500,12 @@ Install:
             Catch ex As Exception
                 Logger.Warn(ex, $"重命名 Mod 失败（{If(ModEntity.File.FullName, "null")}）")
                 IsSuccessful = False
+                Continue For
             End Try
             '更改 Loader 中的列表
-            Dim NewModEntity As New LocalResourceFile(NewPath)
+            Dim NewModEntity As New LocalResourceFile(NewPath) With {.ModIds = ModEntity.ModIds}
             NewModEntity.FromJson(ModEntity.ToJson)
+            If SelectedMods.Remove(ModEntity.File.FullName) Then SelectedMods.Add(NewModEntity.File.FullName)
             If LocalResourceLoader.Output.Contains(ModEntity) Then
                 Dim IndexOfLoader As Integer = LocalResourceLoader.Output.IndexOf(ModEntity)
                 LocalResourceLoader.Output.RemoveAt(IndexOfLoader)
@@ -508,7 +518,8 @@ Install:
             End If
             '更改 UI 中的列表
             Dim NewItem As MyLocalModItem = McModListItem(NewModEntity)
-            ModItems(ModEntity.EnabledName) = NewItem
+            ModItems.Remove(ModEntity.File.FullName)
+            ModItems(NewModEntity.File.FullName) = NewItem
             Dim IndexOfUi As Integer = PanList.Children.IndexOf(PanList.Children.OfType(Of MyLocalModItem).FirstOrDefault(Function(i) i.Entry Is ModEntity))
             If IndexOfUi = -1 Then Continue For '因为未知原因 Mod 的状态已经切换完了
             PanList.Children.RemoveAt(IndexOfUi)
@@ -526,7 +537,7 @@ Install:
 
     '更新
     Private Sub BtnSelectUpdate_Click() Handles BtnSelectUpdate.Click
-        Dim UpdateList As List(Of LocalResourceFile) = LocalResourceLoader.Output.Where(Function(m) SelectedMods.Contains(m.EnabledName) AndAlso m.HasUpdate).ToList()
+        Dim UpdateList As List(Of LocalResourceFile) = LocalResourceLoader.Output.Where(Function(m) SelectedMods.Contains(m.File.FullName) AndAlso m.HasUpdate).ToList()
         If Not UpdateList.Any() Then Return
         UpdateMods(UpdateList)
         ChangeAllSelected(False)
@@ -660,7 +671,7 @@ Install:
 
     '删除
     Private Sub BtnSelectDelete_Click() Handles BtnSelectDelete.Click
-        DeleteMods(LocalResourceLoader.Output.Where(Function(m) SelectedMods.Contains(m.EnabledName)))
+        DeleteMods(LocalResourceLoader.Output.Where(Function(m) SelectedMods.Contains(m.File.FullName)))
         ChangeAllSelected(False)
     End Sub
     Private Sub DeleteMods(ModsToDelete As IEnumerable(Of LocalResourceFile))
@@ -668,14 +679,7 @@ Install:
             Dim IsSuccessful As Boolean = True
             Dim IsShiftPressed As Boolean = My.Computer.Keyboard.ShiftKeyDown
             '确认需要删除的文件
-            Dim ModList = ModsToDelete.SelectMany(
-            Function(Target As LocalResourceFile)
-                If Target.IsEnabled Then
-                    Return {Target.File.FullName, Target.File.FullName & If(FileUtils.Exists(Target.File.FullName & ".old"), ".old", ".disabled")}
-                Else
-                    Return {Target.File.FullName, Target.EnabledFullName}
-                End If
-            End Function).Distinct.Where(Function(m) FileUtils.Exists(m)).Select(Function(m) New LocalResourceFile(m)).ToList()
+            Dim ModList = ModsToDelete.Where(Function(ModEntry) FileUtils.Exists(ModEntry.File.FullName)).ToList()
             '实际删除文件
             For Each ModEntity In ModList
                 '删除
@@ -688,24 +692,24 @@ Install:
                 Catch ex As Exception
                     Logger.Error(ex, $"删除 Mod 失败（{ModEntity.File.FullName}）", LogBehavior.Alert)
                     IsSuccessful = False
+                    Continue For
                 End Try
                 '取消选中
-                SelectedMods.Remove(ModEntity.EnabledName)
+                SelectedMods.Remove(ModEntity.File.FullName)
                 '更改 Loader 和 UI 中的列表
                 LocalResourceLoader.Output.Remove(ModEntity)
                 SearchResult?.Remove(ModEntity)
-                ModItems.Remove(ModEntity.EnabledName)
+                ModItems.Remove(ModEntity.File.FullName)
                 Dim IndexOfUi As Integer = PanList.Children.IndexOf(PanList.Children.OfType(Of MyLocalModItem).FirstOrDefault(Function(i) i.Entry.Equals(ModEntity)))
                 If IndexOfUi >= 0 Then PanList.Children.RemoveAt(IndexOfUi)
             Next
-            RefreshBars()
             If Not IsSuccessful Then
                 Hint("由于文件被占用，Mod 删除失败，请尝试关闭正在运行的游戏后再试！", HintType.Red)
                 ReloadModList(True)
-            ElseIf PanList.Children.Count = 0 Then
+            ElseIf LocalResourceLoader.Output.Count = 0 Then
                 ReloadModList(True) '删除了全部文件
             Else
-                RefreshBars()
+                RefreshUI()
             End If
             '显示结果提示
             If Not IsSuccessful Then Return
@@ -814,6 +818,9 @@ Install:
                 Dim SearchSources As New List(Of SearchSource)
                 SearchSources.Add(New SearchSource(Entry.Display, 1))
                 SearchSources.Add(New SearchSource(Entry.File.Name, 1))
+                For Each Id In Entry.ModIds
+                    SearchSources.Add(New SearchSource(Id, 1))
+                Next
                 If Entry.Version IsNot Nothing Then
                     SearchSources.Add(New SearchSource(Entry.Version, 0.2))
                 End If

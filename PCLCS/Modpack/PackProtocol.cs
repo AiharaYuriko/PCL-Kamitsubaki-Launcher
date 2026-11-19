@@ -166,7 +166,8 @@ public static class PackProtocol {
             },
             "baseline": {
               "type":"array", "items":{"type":"object","additionalProperties":false,"required":["path","sha256"],"properties":{
-                "path":{"type":"string"}, "sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"}, "id":{"type":"string","pattern":"^[a-z][a-z0-9_]{1,63}$"}
+                "path":{"type":"string"}, "sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"}, "id":{"type":"string","pattern":"^[a-z][a-z0-9_]{1,63}$"},
+                "fabric_id":{"type":"string","pattern":"^[a-z][a-z0-9_-]{1,63}$"}
               }}
             },
             "baseline_instance":{"type":"string","minLength":1},
@@ -178,6 +179,8 @@ public static class PackProtocol {
               "force_disabled":{"type":"boolean"},
               "optional":{"type":"boolean"},
               "id":{"type":"string","pattern":"^[a-z][a-z0-9_]{1,63}$"},
+              "ids":{"type":"array","minItems":2,"uniqueItems":true,"items":{"type":"string","pattern":"^[a-z][a-z0-9_]{1,63}$"}},
+              "fabric_id":{"type":"string","pattern":"^[a-z][a-z0-9_-]{1,63}$"},
               "sources":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["platform","project","version"],"properties":{
                 "platform":{"enum":["curseforge","modrinth"]}, "project":{"type":"string","pattern":"^[A-Za-z0-9]+$"}, "version":{"type":"string","pattern":"^[A-Za-z0-9]+$"}
               }}},
@@ -203,11 +206,13 @@ public static class PackProtocol {
         var actionItem = props["actions"]!["items"]!;
         actionItem["properties"]!["force"] = new JObject { ["type"] = "boolean" };
         actionItem["properties"]!["id"] = fileProps["id"]!.DeepClone();
+        actionItem["properties"]!["fabric_id"] = fileProps["fabric_id"]!.DeepClone();
     }
     private static void ValidateArchiveRelease(JObject value) {
         long archiveSize = (long)value["archive"]!["size"]!;
         var baseline = value["baseline"]!.Select(f => (string)f["path"]!).ToArray();
         Unique(baseline, "旧整合包文件路径");
+        foreach (var file in value["baseline"]!) ValidateModIdentity(file, (string)file["path"]!);
         foreach (var path in baseline) ValidateRelative(path, false);
         Unique(baseline.Where(ManagedMod).Select(EnabledModPath), "基线 Mod 路径");
         var ranges = new List<(long Offset, long Length)>();
@@ -215,7 +220,7 @@ public static class PackProtocol {
         foreach (var file in value["files"]!) {
             string path = (string)file["path"]!;
             if (ManagedMod(path) && !mods.Add(EnabledModPath(path))) throw new InvalidDataException("同一 Mod 有两个启用状态：" + path);
-            if (file["id"] != null && !ManagedMod(path)) throw new InvalidDataException("只有 Mod 可以声明 Mod ID。");
+            ValidateModIdentity(file, path);
             if ((bool?)file["force_disabled"] == true && (!ManagedMod(path) || !path.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidDataException("强制禁用的目标必须是禁用状态的 Mod。");
             if (file["json_patch"] != null && (!path.StartsWith("config/", StringComparison.OrdinalIgnoreCase) ||
@@ -233,7 +238,7 @@ public static class PackProtocol {
         }
         foreach (var action in value["actions"]!) {
             string path = (string)action["path"]!;
-            if (action["id"] != null && !ManagedMod(path)) throw new InvalidDataException("只有 Mod 操作能声明 Mod ID。");
+            ValidateModIdentity(action, path);
             if (ManagedMod(path) && !mods.Add(EnabledModPath(path))) throw new InvalidDataException("同一 Mod 文件存在多个更新操作：" + path);
         }
         long previousEnd = 0;
@@ -245,6 +250,16 @@ public static class PackProtocol {
     internal static bool ManagedMod(string path) => path.StartsWith("mods/", StringComparison.OrdinalIgnoreCase) &&
         (path.EndsWith(".jar", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".jar.disabled", StringComparison.OrdinalIgnoreCase));
     internal static string EnabledModPath(string path) => path.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase) ? path.Substring(0, path.Length - 9) : path;
+    internal static string? PrimaryForgeId(JToken record) => (string?)record["id"] ?? (string?)record["ids"]?.First;
+    internal static string? ModIdentity(JToken record) => (string?)record["fabric_id"] is string fabricId ? "fabric/" + fabricId
+        : PrimaryForgeId(record) is string forgeId ? "forge/" + forgeId : null;
+    internal static IEnumerable<string> ModProjects(JToken? sources) => sources is JArray entries
+        ? entries.Select(source => (string)source["platform"]! + "/" + (string)source["project"]!).Distinct(StringComparer.Ordinal)
+        : Enumerable.Empty<string>();
+    private static void ValidateModIdentity(JToken record, string path) {
+        int count = new[] { "id", "ids", "fabric_id" }.Count(field => record[field] != null);
+        if (count > 1 || count == 1 && !ManagedMod(path)) throw new InvalidDataException("无效的 Mod ID 声明：" + path);
+    }
     private static void Unique(IEnumerable<string> values, string name) { var list = values.ToList(); if (list.Distinct(StringComparer.OrdinalIgnoreCase).Count() != list.Count) throw new InvalidDataException(name + "重复。"); }
     // This evaluator intentionally only supports the vocabulary used by the embedded schemas.
     private static bool Schema(JToken value, JObject schema, string at, bool fail) {

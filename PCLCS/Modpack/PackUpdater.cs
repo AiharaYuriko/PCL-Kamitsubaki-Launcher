@@ -28,8 +28,9 @@ public sealed class PackPlan {
     public List<string> Preserved { get; } = new();
     public int? BaselineMatches { get; internal set; }
     internal List<JObject> RetainedRecords { get; } = new();
-    internal Dictionary<string, JObject> PriorForOptional { get; } = new(StringComparer.OrdinalIgnoreCase);
+    internal Dictionary<string, List<JObject>> PriorForOptional { get; } = new(StringComparer.OrdinalIgnoreCase);
     internal Dictionary<string, string> FileTargets { get; } = new(StringComparer.OrdinalIgnoreCase);
+    internal Dictionary<string, string[]> ModProjectsByHash { get; set; } = new(StringComparer.Ordinal);
     public bool IsApplied => (string?)Release["schema"] == PackProtocol.ArchiveRelease && (long?)State["sequence"] == (long?)Release["release"]?["sequence"];
     public long Bytes => Changes.Where(c => c.File != null).Sum(c => (long)c.File!["size"]!);
 
@@ -54,8 +55,12 @@ public sealed class PackRuntime {
 /// <summary>One instance, one transaction, one retained rollback. Caller holds the PCL instance lock.</summary>
 public sealed partial class PackUpdater {
     private readonly string root;
+    private readonly Action<IEnumerable<PackPublishFile>>? resolveModSources;
     private string Work(string relative) => PackProtocol.Safe(root, ".pcl-update/" + relative, true);
-    public PackUpdater(string root) { this.root = System.IO.Path.GetFullPath(root); }
+    public PackUpdater(string root, Action<IEnumerable<PackPublishFile>>? resolveModSources = null) {
+        this.root = System.IO.Path.GetFullPath(root);
+        this.resolveModSources = resolveModSources;
+    }
     public bool NeedsRecovery => File.Exists(Work("pending/journal.json"));
     public bool HasBackup => File.Exists(Work("previous/journal.json"));
     public JObject State => File.Exists(Work("state.json")) ? PackProtocol.Parse(File.ReadAllBytes(Work("state.json"))) : new JObject();
@@ -96,7 +101,9 @@ public sealed partial class PackUpdater {
     }
     private string? Hash(string relative, bool internalFile = false) { string path = PackProtocol.Safe(root, relative, internalFile); if (Directory.Exists(path)) throw new IOException("目标路径被文件夹占用：" + relative); return File.Exists(path) ? PackProtocol.HashFile(path) : null; }
     private static bool Included(JToken item, HashSet<string> selected) => item["component"] == null || item["component"]!.Type == JTokenType.Null || selected.Contains((string)item["component"]!);
-    public PackPlan Plan(JObject release, IEnumerable<string> selected) {
+    public PackPlan Plan(JObject release, IEnumerable<string> selected) => Plan(release, selected, new Dictionary<string, string[]>(StringComparer.Ordinal));
+
+    private PackPlan Plan(JObject release, IEnumerable<string> selected, Dictionary<string, string[]> modProjects) {
         if (NeedsRecovery) throw new IOException("上次更新尚未完成，请先恢复。");
         PackProtocol.Validate(release, "release");
         var state = State;
@@ -108,7 +115,7 @@ public sealed partial class PackUpdater {
         }
         var choice = new HashSet<string>(selected);
         foreach (var c in release["components"]!) if ((bool)c["required"]!) choice.Add((string)c["id"]!);
-        var plan = new PackPlan { Release = (JObject)release.DeepClone(), State = state, Selected = choice };
+        var plan = new PackPlan { Release = (JObject)release.DeepClone(), State = state, Selected = choice, ModProjectsByHash = modProjects };
         if ((string?)release["schema"] == PackProtocol.ArchiveRelease) return PlanArchive(plan);
         var previous = (state["files"] as JArray ?? new JArray()).Cast<JObject>().ToDictionary(f => (string)f["path"]!, StringComparer.OrdinalIgnoreCase);
         foreach (JObject file in release["files"]!.Where(f => Included(f, choice))) {
@@ -151,7 +158,7 @@ public sealed partial class PackUpdater {
     public void Apply(PackPlan preview, Func<PackRuntime> prepareRuntime, Action<string> progress, Action<string, string, long>? download = null,
         PackDownloadOptions? options = null) {
         if (NeedsRecovery) throw new IOException("请先恢复上次更新。");
-        var plan = Plan(preview.Release, preview.Selected);
+        var plan = Plan(preview.Release, preview.Selected, preview.ModProjectsByHash);
         if (Signature(plan) != Signature(preview)) throw new IOException("本地文件已变化，请重新检查更新。");
         if (plan.IsApplied) { progress("此版本已应用。"); return; }
         bool archived = (string?)plan.Release["schema"] == PackProtocol.ArchiveRelease;
@@ -186,7 +193,7 @@ public sealed partial class PackUpdater {
                 new HashSet<string>((plan.State["selected"] as JArray ?? new JArray()).Select(item => item.Value<string>()!)).SetEquals(plan.Selected)) {
                 progress("已是最新，文件检查通过。"); return;
             }
-            if (Signature(Plan(preview.Release, preview.Selected)) != Signature(plan)) throw new IOException("下载期间本地文件发生变化，请重新检查。");
+            if (Signature(Plan(preview.Release, preview.Selected, plan.ModProjectsByHash)) != Signature(plan)) throw new IOException("下载期间本地文件发生变化，请重新检查。");
             var changes = plan.Changes.Where(c => !skipped.Contains(c.Path) &&
                 (c.DependsOn == null || !skipped.Contains(c.DependsOn))).ToList();
             var paths = changes.Select(c => c.Path).Concat(changes.Select(c => c.ToggleDestination).OfType<string>()).Concat(runtime.Paths).Append(".pcl-update/state.json").Distinct(StringComparer.OrdinalIgnoreCase).ToList();
