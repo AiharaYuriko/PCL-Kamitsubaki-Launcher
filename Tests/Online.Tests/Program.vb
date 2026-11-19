@@ -77,13 +77,14 @@ Module Program
         IO.File.WriteAllText(OldFile, "old")
         IO.File.WriteAllText(NewFile, "new")
         OnlineReplace(-1, OldFile, NewFile, False, NewFile)
-        Assert(IO.File.ReadAllText(OldFile) = "new" AndAlso IO.File.ReadAllText(OldFile & ".update-backup") = "old", "Replacement or backup failed")
+        Assert(IO.File.ReadAllText(OldFile) = "new", "Replacement failed")
+        Assert(Not IO.File.Exists(OldFile & ".update-backup"), "Replacement left a backup")
         Try
             OnlineReplace(-1, OldFile, OldFile, False, NewFile)
             Throw New Exception("Invalid replacement path accepted")
         Catch ex As Exception When ex.Message = "无效的更新替换路径。"
         End Try
-        Console.WriteLine("PASS: client configuration, product isolation, SHA256 rejection/success, HTTPS, announcement filtering/deduplication, disabled services, current/legacy update commands, replacement/backup/path validation.")
+        Console.WriteLine("PASS: client configuration, product isolation, SHA256 rejection/success, HTTPS, announcement filtering/deduplication, disabled services, current/legacy update commands, replacement without backup, path validation.")
     End Sub
     Public Function NetRequestByClientRetry(Url As String) As String
         Calls += 1

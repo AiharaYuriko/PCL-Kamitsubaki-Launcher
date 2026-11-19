@@ -137,7 +137,7 @@ Friend Module ModOnline
         End Try
         Dim Pending = Destination & ".update-new"
         IO.File.Copy(Source, Pending, True)
-        IO.File.Replace(Pending, Destination, Destination & ".update-backup", True)
+        IO.File.Replace(Pending, Destination, Nothing, True)
         If Restart Then Process.Start(New ProcessStartInfo(Destination) With {.UseShellExecute = True})
     End Sub
 

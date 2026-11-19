@@ -1,6 +1,6 @@
 # 定制版登录、更新与公告
 
-参考 PCL-CE 的服务结构，使用本项目的应用标识和发布源。登录采用微软设备代码流程；更新下载使用 HTTPS 和 SHA-256，退出后以独立更新进程替换 EXE，保留 `.update-backup`。公告以文本显示。
+参考 PCL-CE 的服务结构，使用本项目的应用标识和发布源。登录采用微软设备代码流程；更新下载使用 HTTPS 和 SHA-256，退出后以独立更新进程替换 EXE。公告以文本显示。
 
 ## 配置与发布
 
@@ -56,6 +56,6 @@ MicrosoftClientId 由构建流程注入，Minecraft 应用审核与真实登录�
 
 ## 验证
 
-`dotnet run --project Tests/Online.Tests/Online.Tests.vbproj -c Release` 使用模拟网络检查缺少 Client ID、产品隔离、错误哈希拒绝、正确哈希暂存、HTTP 拒绝、公告重要性筛选与去重、关闭联网设置，以及临时文件的替换与备份。
+`dotnet run --project Tests/Online.Tests/Online.Tests.vbproj -c Release` 使用模拟网络检查缺少 Client ID、产品隔离、错误哈希拒绝、正确哈希暂存、HTTP 拒绝、公告重要性筛选与去重、关闭联网设置、新旧更新命令，以及 EXE 替换后是否留有备份。
 
 2026-11-07：完整 Windows Release 构建成功，独立 EXE 的主界面、实例设置、整合包更新页面和正常退出已检查；确认 Client ID 已嵌入且源码配置恢复为空。在线服务测试及整合包更新器 11 项回归测试通过。真实微软账号授权、线上下载和运行中启动器的自更新全流程仍待验证。
