@@ -67,21 +67,23 @@ Module Program
         Before = Calls
         OnlineLoad()
         Assert(Calls = Before, "Disabled services still access network")
+        Assert(IsOnlineReplaceArgument("--update"), "Current update command rejected")
+        Assert(IsOnlineReplaceArgument("update"), "Legacy update command rejected")
+        Assert(Not IsOnlineReplaceArgument(Nothing) AndAlso Not IsOnlineReplaceArgument("--wait"), "Normal launch treated as update")
         Dim TestRoot = IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ReplaceTest", Guid.NewGuid().ToString("N"))
         Dim OldFile = IO.Path.Combine(TestRoot, "Launcher.exe")
         Dim NewFile = IO.Path.Combine(TestRoot, "PCL", "CustomUpdate", "test", "Launcher.exe")
         IO.Directory.CreateDirectory(IO.Path.GetDirectoryName(NewFile))
         IO.File.WriteAllText(OldFile, "old")
         IO.File.WriteAllText(NewFile, "new")
-        PathExe = NewFile
-        OnlineReplace(-1, OldFile, NewFile, False)
+        OnlineReplace(-1, OldFile, NewFile, False, NewFile)
         Assert(IO.File.ReadAllText(OldFile) = "new" AndAlso IO.File.ReadAllText(OldFile & ".update-backup") = "old", "Replacement or backup failed")
         Try
-            OnlineReplace(-1, OldFile, OldFile, False)
+            OnlineReplace(-1, OldFile, OldFile, False, NewFile)
             Throw New Exception("Invalid replacement path accepted")
         Catch ex As Exception When ex.Message = "无效的更新替换路径。"
         End Try
-        Console.WriteLine("PASS: client configuration, product isolation, SHA256 rejection/success, HTTPS, announcement filtering/deduplication, disabled services, replacement/backup/path validation.")
+        Console.WriteLine("PASS: client configuration, product isolation, SHA256 rejection/success, HTTPS, announcement filtering/deduplication, disabled services, current/legacy update commands, replacement/backup/path validation.")
     End Sub
     Public Function NetRequestByClientRetry(Url As String) As String
         Calls += 1

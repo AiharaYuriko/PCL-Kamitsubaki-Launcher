@@ -104,20 +104,28 @@ Friend Module ModOnline
         End Try
     End Sub
 
+    Private Const OnlineReplaceArgument As String = "--update"
+
+    Friend Function IsOnlineReplaceArgument(Argument As String) As Boolean
+        '已发布的旧版使用没有前缀的 update 启动更新进程。
+        Return String.Equals(Argument, OnlineReplaceArgument, StringComparison.Ordinal) OrElse
+            String.Equals(Argument, "update", StringComparison.Ordinal)
+    End Function
+
     Friend Sub OnlineRestart(Restart As Boolean)
         If Not IsUpdateWaitingRestart OrElse Not IO.File.Exists(StagedFile) Then Return
-        Dim Args = $"update {Process.GetCurrentProcess().Id} ""{PathExe}"" ""{StagedFile}"" {Restart}"
+        Dim Args = $"{OnlineReplaceArgument} {Process.GetCurrentProcess().Id} ""{PathExe}"" ""{StagedFile}"" {Restart}"
         Process.Start(New ProcessStartInfo(StagedFile, Args) With {.UseShellExecute = False, .CreateNoWindow = True, .WindowStyle = ProcessWindowStyle.Hidden})
         IsUpdateWaitingRestart = False
         If Restart Then RunInUi(Sub() FrmMain.EndProgram(False))
     End Sub
 
-    Friend Sub OnlineReplace(ProcessId As Integer, OldName As String, NewName As String, Restart As Boolean)
+    Friend Sub OnlineReplace(ProcessId As Integer, OldName As String, NewName As String, Restart As Boolean, RunningExe As String)
         '只允许由正在运行的更新文件替换同一安装目录中的启动器。
         Dim Source = IO.Path.GetFullPath(NewName)
         Dim Destination = IO.Path.GetFullPath(OldName)
         Dim ExpectedRoot = IO.Path.Combine(IO.Path.GetDirectoryName(Destination), "PCL", "CustomUpdate") & IO.Path.DirectorySeparatorChar
-        If Not Source.Equals(IO.Path.GetFullPath(PathExe), StringComparison.OrdinalIgnoreCase) OrElse
+        If Not Source.Equals(IO.Path.GetFullPath(RunningExe), StringComparison.OrdinalIgnoreCase) OrElse
             Not Source.StartsWith(ExpectedRoot, StringComparison.OrdinalIgnoreCase) OrElse
             Not Destination.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) Then Throw New Exception("无效的更新替换路径。")
         Try

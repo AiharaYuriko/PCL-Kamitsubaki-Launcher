@@ -158,9 +158,6 @@ Friend Module ModSecret
             Logger.Error(ex, "启动更新程序失败", LogBehavior.Toast)
         End Try
     End Sub
-    Public Sub UpdateReplace(ProcessId As Integer, OldFileName As String, NewFileName As String, TriggerRestart As Boolean)
-        OnlineReplace(ProcessId, OldFileName, NewFileName, TriggerRestart)
-    End Sub
 
     ''' <summary>
     ''' 确保 PathTemp/Latest.exe 是最新正式版的 PCL，它会被用于整合包打包。
