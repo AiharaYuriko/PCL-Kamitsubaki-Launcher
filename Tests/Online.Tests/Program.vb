@@ -14,6 +14,8 @@ Module Program
     Public Downloads As Integer
     Public Failure As Exception
     Public Payload As Byte() = Encoding.UTF8.GetBytes("test launcher payload")
+    Public ReadOnly DownloadUrls As New List(Of String)
+    Public CorruptDownloadUrl As String
 
     Sub Assert(Value As Boolean, Message As String)
         If Not Value Then Throw New Exception(Message)
@@ -52,6 +54,7 @@ Module Program
         Responses("https://test.invalid/update") = Update.ToString()
         OnlineCheck(True)
         Assert(Failure Is Nothing AndAlso IsUpdateWaitingRestart, "Verified update not staged")
+        TestMirror(Update)
         Settings.Values("SystemSystemUpdate") = 3
         Settings.Values("SystemSystemActivity") = 1
         Dim Unique = Guid.NewGuid().ToString()
@@ -84,15 +87,52 @@ Module Program
             Throw New Exception("Invalid replacement path accepted")
         Catch ex As Exception When ex.Message = "无效的更新替换路径。"
         End Try
-        Console.WriteLine("PASS: client configuration, product isolation, SHA256 rejection/success, HTTPS, announcement filtering/deduplication, disabled services, current/legacy update commands, replacement without backup, path validation.")
+        Console.WriteLine("PASS: client configuration, S3 preference and fallback, product isolation, SHA256 rejection/success, HTTPS, announcement filtering/deduplication, disabled services, current/legacy update commands, replacement without backup, path validation.")
+    End Sub
+    Private Sub TestMirror(Update As JObject)
+        Const GitHubManifest = "https://github.example/update"
+        Const MirrorManifest = "https://s3.example/update"
+        Const MirrorFile = "https://s3.example/launcher.exe"
+        IO.File.WriteAllText(IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "PCL.Online.json"),
+                            New JObject From {{"UpdateUrl", GitHubManifest}, {"S3UpdateUrl", MirrorManifest}}.ToString())
+        Environment.SetEnvironmentVariable("PCL_UPDATE_URL", Nothing)
+        Dim Mirror = CType(Update.DeepClone(), JObject)
+        Mirror("mirrorDownloadUrl") = MirrorFile
+        Responses(MirrorManifest) = Mirror.ToString()
+        Responses(GitHubManifest) = Update.ToString()
+
+        DownloadUrls.Clear()
+        OnlineCheck(True)
+        Assert(DownloadUrls.SequenceEqual({MirrorFile}), "S3 did not take precedence")
+
+        CorruptDownloadUrl = MirrorFile
+        DownloadUrls.Clear()
+        OnlineCheck(True)
+        Assert(DownloadUrls.SequenceEqual({MirrorFile, Update.Value(Of String)("downloadUrl")}), "Corrupt mirror did not fall back")
+        CorruptDownloadUrl = Nothing
+
+        Mirror("versionCode") = VersionCode
+        Responses(MirrorManifest) = Mirror.ToString()
+        DownloadUrls.Clear()
+        OnlineCheck(True)
+        Assert(DownloadUrls.SequenceEqual({Update.Value(Of String)("downloadUrl")}), "Stale S3 manifest hid the GitHub release")
+
+        Responses.Remove(MirrorManifest)
+        DownloadUrls.Clear()
+        OnlineCheck(True)
+        Assert(DownloadUrls.SequenceEqual({Update.Value(Of String)("downloadUrl")}), "Unavailable S3 manifest did not fall back")
     End Sub
     Public Function NetRequestByClientRetry(Url As String) As String
         Calls += 1
         Return Responses(Url)
     End Function
+    Public Function NetRequestByClient(Url As String, Timeout As Integer, MakeLog As Boolean) As String
+        Return NetRequestByClientRetry(Url)
+    End Function
     Public Sub NetDownloadByLoader(Url As String, Target As String, Loader As LoaderBase)
         Downloads += 1
-        IO.File.WriteAllBytes(Target, Payload)
+        DownloadUrls.Add(Url)
+        IO.File.WriteAllBytes(Target, If(Url = CorruptDownloadUrl, New Byte() {0}, Payload))
     End Sub
     Public Function MyMsgBox(Text As String, Title As String, Optional First As String = "确定", Optional Second As String = "") As Integer
         Messages += 1
@@ -103,6 +143,12 @@ Module Program
     Public Sub RunInUi(Action As Action)
         Action()
     End Sub
+End Module
+Public Module ExceptionExtensions
+    <Runtime.CompilerServices.Extension>
+    Public Function IsCanceled(Value As Exception) As Boolean
+        Return TypeOf Value.GetBaseException() Is OperationCanceledException
+    End Function
 End Module
 Public Class LoaderBase
 End Class

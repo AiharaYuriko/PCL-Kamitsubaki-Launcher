@@ -44,13 +44,44 @@ Friend Module ModOnline
         Return JObject.Parse(NetRequestByClientRetry(Https(Address)))
     End Function
 
-    Private Function ReadUpdate() As JObject
-        Dim Data = Fetch("UpdateUrl", "PCL_UPDATE_URL")
-        If Data Is Nothing Then Return Nothing
+    Private Function ReadUpdate(Optional CheckBoth As Boolean = False) As JObject
+        Dim GitHubUrl = OnlineSetting("UpdateUrl", "PCL_UPDATE_URL")
+        Dim MirrorUrl = If(String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("PCL_UPDATE_URL")),
+                           OnlineSetting("S3UpdateUrl", "PCL_S3_UPDATE_URL"), "")
+        Dim Mirror As JObject = Nothing
+        If MirrorUrl <> "" Then
+            Try
+                Mirror = ReadUpdateManifest(MirrorUrl, 6000)
+                UpdateHash(Mirror)
+                Https(Mirror.Value(Of String)("mirrorDownloadUrl"))
+                Https(Mirror.Value(Of String)("downloadUrl"))
+            Catch ex As Exception When Not ex.IsCanceled
+                Mirror = Nothing
+            End Try
+        End If
+
+        Dim Data = Mirror
+        If GitHubUrl <> "" AndAlso (Mirror Is Nothing OrElse CheckBoth OrElse Mirror.Value(Of Integer)("versionCode") <= VersionCode) Then
+            Try
+                Dim GitHub = ReadUpdateManifest(GitHubUrl, If(Mirror Is Nothing, 0, 6000))
+                If Mirror Is Nothing OrElse GitHub.Value(Of Integer)("versionCode") > Mirror.Value(Of Integer)("versionCode") Then
+                    Data = GitHub
+                End If
+            Catch ex As Exception When Mirror IsNot Nothing AndAlso Not ex.IsCanceled
+                'S3 可用时，备用清单的错误不影响版本检查。
+            End Try
+        End If
+        If Data IsNot Nothing Then Latest = Data
+        Return Data
+    End Function
+
+    Private Function ReadUpdateManifest(Address As String, Timeout As Integer) As JObject
+        Dim Url = Https(Address)
+        Dim Data = JObject.Parse(If(Timeout = 0, NetRequestByClientRetry(Url),
+                                   NetRequestByClient(Url, Timeout:=Timeout, MakeLog:=False)))
         Dim Product = OnlineSetting("ProductId", "PCL_PRODUCT_ID")
         If Product = "" OrElse Data.Value(Of String)("productId") <> Product Then Throw New Exception("更新清单与当前定制版的 ProductId 不匹配。")
         If Data("versionCode") Is Nothing OrElse Data.Value(Of Integer)("versionCode") < 1 Then Throw New Exception("更新清单缺少有效版本号。")
-        Latest = Data
         Return Data
     End Function
 
@@ -87,10 +118,28 @@ Friend Module ModOnline
         End SyncLock
     End Sub
 
-    Private Sub DownloadVerified(Data As JObject, Target As String, Optional Loader As LoaderBase = Nothing)
+    Private Function UpdateHash(Data As JObject) As String
         Dim Hash = Data.Value(Of String)("sha256")
         If Hash Is Nothing OrElse Not System.Text.RegularExpressions.Regex.IsMatch(Hash, "\A[0-9a-fA-F]{64}\z") Then Throw New Exception("更新清单缺少有效 SHA-256。")
-        Dim Url = Https(Data.Value(Of String)("downloadUrl"))
+        Return Hash
+    End Function
+
+    Private Sub DownloadVerified(Data As JObject, Target As String, Optional Loader As LoaderBase = Nothing)
+        Dim Hash = UpdateHash(Data)
+        Dim MirrorUrl = Data.Value(Of String)("mirrorDownloadUrl")
+        If Not String.IsNullOrWhiteSpace(MirrorUrl) Then
+            Try
+                DownloadUpdateFile(MirrorUrl, Hash, Target, Loader)
+                Return
+            Catch ex As Exception When Not ex.IsCanceled
+                '使用同一个清单和哈希从备用地址下载。
+            End Try
+        End If
+        DownloadUpdateFile(Data.Value(Of String)("downloadUrl"), Hash, Target, Loader)
+    End Sub
+
+    Private Sub DownloadUpdateFile(Address As String, Hash As String, Target As String, Loader As LoaderBase)
+        Dim Url = Https(Address)
         IO.Directory.CreateDirectory(IO.Path.GetDirectoryName(Target))
         Try
             NetDownloadByLoader(Url, Target, Loader)
@@ -143,7 +192,7 @@ Friend Module ModOnline
 
     Friend Sub OnlineDownloadLatest(Loader As LoaderBase)
         SyncLock Gate
-            Dim Data = ReadUpdate()
+            Dim Data = ReadUpdate(CheckBoth:=True)
             If Data Is Nothing Then Throw New Exception("尚未配置定制版更新源，无法下载打包用启动器。")
             DownloadVerified(Data, PathTemp & "Custom-Latest.exe", Loader)
         End SyncLock

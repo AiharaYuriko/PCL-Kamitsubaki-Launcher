@@ -12,12 +12,15 @@
 | --- | --- | --- |
 | MicrosoftClientId | PCL_MS_CLIENT_ID | 发布者自己的微软应用 ID；不是 Client Secret |
 | ProductId | PCL_PRODUCT_ID | 定制版身份，默认 kamitsubaki-pcl |
-| UpdateUrl | PCL_UPDATE_URL | 更新清单的公开 HTTPS 地址 |
+| UpdateUrl | PCL_UPDATE_URL | GitHub 备用更新清单。设置环境变量可单独指定更新源 |
+| S3UpdateUrl | PCL_S3_UPDATE_URL | 优先使用的 Worker 更新清单地址，可留空关闭 S3 线路 |
 | AnnouncementUrl | PCL_ANNOUNCEMENT_URL | 公告清单的公开 HTTPS 地址 |
 
-MicrosoftClientId 由构建流程注入，Minecraft 应用审核与真实登录测试待完成；启动器默认从本仓库最新 GitHub Release 的 `update.json` 检查更新。公告地址可自行配置。微软应用需支持个人账号设备代码登录及 Minecraft 服务访问。
+MicrosoftClientId 由构建流程注入，Minecraft 应用审核与真实登录测试待完成。启动器优先读取 S3 更新清单，清单不可用或未报告新版时检查 GitHub。如果 S3 下载或校验失败，会用同一份清单中的 GitHub 地址下载并校验相同版本。公告地址可自行配置。微软应用需支持个人账号设备代码登录及 Minecraft 服务访问。
 
 更新和公告可以放在已有对象存储的独立目录，例如 `launcher/update.json` 和 `launcher/announcements.json`，不要覆盖整合包更新清单。先发布完整、可独立运行的 EXE，再发布清单。不支持 ZIP、差分包或多文件部署；需要随 EXE 分发依赖的构建不能使用此更新方式。每次发布递增 `ModBase.vb` 中的版本名及 VersionCode，同步 `AssemblyInfo.vb` 的文件版本，并在 `PCL.ReleaseNotes.json` 中添加正式版版本码、版本名和用户可读的更新说明。启动后的升级弹窗和下载前的更新清单共用这些说明。Release 构建自动生成 `update.json`；将它与同次构建的 `PCL-Kamitsubaki.exe` 和 `SHA256SUMS.txt` 一起发布到标签 `v<文件版本>` 的最新正式 Release。早期定制版可设置 `PCL_UPDATE_URL=https://github.com/AiharaYuriko/PCL-Kamitsubaki-Launcher/releases/latest/download/update.json` 并重启后检查更新。
+
+GitHub 正式 Release 发布后，**Sync launcher release to S3** 工作流按标签下载并校验 EXE 和清单，再镜像到 `pcl-mirror/pcl/launcher`。它通过 `s3-sign.kaf.mom` 回读 EXE 验证 SHA-256，最后更新 S3 清单。可在 Actions 按标签手动补跑，旧版本补跑不会覆盖较新的清单。仓库 Actions Secrets 使用 `S3_ACCESS_KEY_ID` 和 `S3_SECRET_ACCESS_KEY`，Actions Variables 使用 `S3_ENDPOINT`、`S3_BUCKET`、`S3_REGION` 和 `S3_PREFIX`。Worker 需允许 `/pcl/launcher/update.json` 和 `/pcl/launcher/releases/v<文件版本>/PCL-Kamitsubaki.exe`。
 
 更新清单示例（哈希必须替换为实际 EXE 的 SHA-256）：
 

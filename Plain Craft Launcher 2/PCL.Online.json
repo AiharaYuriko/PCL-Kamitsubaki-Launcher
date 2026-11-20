@@ -2,5 +2,6 @@
   "ProductId": "kamitsubaki-pcl",
   "MicrosoftClientId": "",
   "UpdateUrl": "https://github.com/AiharaYuriko/PCL-Kamitsubaki-Launcher/releases/latest/download/update.json",
+  "S3UpdateUrl": "https://s3-sign.kaf.mom/pcl/launcher/update.json",
   "AnnouncementUrl": ""
 }
