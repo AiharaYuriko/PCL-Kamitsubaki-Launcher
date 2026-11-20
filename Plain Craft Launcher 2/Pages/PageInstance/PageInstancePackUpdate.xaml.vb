@@ -32,7 +32,7 @@ Public Class PageInstancePackUpdate
         Dim SavedMirror = CStr(Binding("mirror_url"))
         FollowDefaultMirror = SavedMirror Is Nothing OrElse (DefaultMirror.Length > 0 AndAlso SavedMirror = DefaultMirror)
         MirrorSource.Text = If(SavedMirror, DefaultMirror)
-        PreferMirror.Checked = CBool(If(Binding("prefer_mirror"), New JValue(False)))
+        PreferMirror.Checked = CBool(If(Binding("prefer_mirror"), New JValue(True)))
         PreferMirror.IsEnabled = Not String.IsNullOrWhiteSpace(MirrorSource.Text)
         Status.Text = "可以直接读取默认更新源，也可以输入服主提供的地址。"
         Restore.IsEnabled = Updater.HasBackup OrElse Updater.NeedsRecovery
