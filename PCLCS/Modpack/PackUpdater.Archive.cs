@@ -13,7 +13,9 @@ public sealed class PackDownloadOptions {
 
 public sealed partial class PackUpdater {
     private PackPlan PlanArchive(PackPlan plan) {
-        if (plan.IsApplied) return plan;
+        bool repairing = plan.IsCurrentArchiveRelease;
+        if (repairing && plan.State["selected"] is JArray installedComponents)
+            plan.Selected = new HashSet<string>(installedComponents.Values<string>()!);
         var previous = ((JArray?)plan.State["files"] ?? (JArray)plan.Release["baseline"]!).Cast<JObject>().ToList();
         var previousByPath = previous.ToDictionary(f => (string)f["path"]!, StringComparer.OrdinalIgnoreCase);
         var previousById = previous.ToLookup(PackProtocol.ModIdentity, StringComparer.Ordinal);
@@ -46,11 +48,12 @@ public sealed partial class PackUpdater {
         }
         var targets = new HashSet<string>(plan.Release["files"]!.Select(f => (string)f["path"]!), StringComparer.OrdinalIgnoreCase);
         var handled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var actions = plan.Release["actions"]!.Cast<JObject>().Where(a => Included(a, plan.Selected)).ToList();
+        var actions = plan.Release["actions"]!.Cast<JObject>().Where(a => !repairing && Included(a, plan.Selected)).ToList();
         var actionModPaths = new HashSet<string>(actions.Select(a => (string)a["path"]!).Where(PackProtocol.ManagedMod)
             .Select(PackProtocol.EnabledModPath), StringComparer.OrdinalIgnoreCase);
         foreach (var action in actions) handled.Add((string)action["path"]!);
-        var selectedFiles = plan.Release["files"]!.Cast<JObject>().Where(f => Included(f, plan.Selected)).ToList();
+        var selectedFiles = plan.Release["files"]!.Cast<JObject>()
+            .Where(f => Included(f, plan.Selected) && (!repairing || PackProtocol.ManagedMod((string)f["path"]!))).ToList();
         var modTargets = new HashSet<string>(selectedFiles.Select(f => (string)f["path"]!).Where(PackProtocol.ManagedMod)
             .Select(PackProtocol.EnabledModPath), StringComparer.OrdinalIgnoreCase);
         var claimedIds = new HashSet<string>(StringComparer.Ordinal);
@@ -61,6 +64,8 @@ public sealed partial class PackUpdater {
         var replacementByPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (JObject file in selectedFiles) {
             string requested = (string)file["path"]!;
+            bool isMod = PackProtocol.ManagedMod(requested);
+            bool forceDisabled = !repairing && (bool?)file["force_disabled"] == true;
             string? managedId = PackProtocol.ModIdentity(file);
             var platformCandidates = file["sources"] != null && (string?)file["write_policy"] != "preserve"
                 ? platformMatches.Value[requested] : Enumerable.Empty<string>();
@@ -73,12 +78,12 @@ public sealed partial class PackUpdater {
                 bool keepEnabled = priorPaths.Count == 1
                     ? !priorPaths[0].EndsWith(".disabled", StringComparison.OrdinalIgnoreCase)
                     : candidates.Any(path => !path.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase));
-                string actualTarget = candidates.Count == 0 || (bool?)file["force_disabled"] == true
+                string actualTarget = candidates.Count == 0 || forceDisabled
                     ? requested
                     : keepEnabled ? enabled : enabled + ".disabled";
                 string? existing = LocalHash(actualTarget);
                 string targetSha = (string)file["sha256"]!;
-                bool forced = (bool?)file["force"] == true || (bool?)file["force_disabled"] == true;
+                bool forced = (bool?)file["force"] == true || forceDisabled;
 
                 if (managedId != null) targetById.Add(managedId, actualTarget);
                 plan.FileTargets[requested] = actualTarget;
@@ -108,7 +113,9 @@ public sealed partial class PackUpdater {
                     }
                 }
                 if (toggleSource == null && existing != targetSha) {
-                    AddAt(plan, file, actualTarget, forced ? "强制更新" : existing == null ? "新增" : "更新", existing, file);
+                    string kind = forced ? "强制更新" : existing != null || candidates.Count != 0 ? "更新" :
+                        repairing || ModRecord(requested) != null ? "补装" : "新增";
+                    AddAt(plan, file, actualTarget, kind, existing, file);
                 }
                 foreach (string candidate in candidates) {
                     handled.Add(candidate);
@@ -128,7 +135,7 @@ public sealed partial class PackUpdater {
             string? found = FindLocal(requested, LocalHash);
             string? extraOld = null;
             JObject? old = previousByPath.TryGetValue(requested, out var prior) ? prior : null;
-            if (PackProtocol.ManagedMod(requested)) {
+            if (isMod) {
                 string enabled = PackProtocol.EnabledModPath(requested);
                 old ??= ModRecord(requested);
                 if (old == null && managedId is string id) {
@@ -153,7 +160,7 @@ public sealed partial class PackUpdater {
                 }
                 found ??= ById(managedId);
                 string? priorStatePath = extraOld ?? found;
-                if ((bool?)file["force_disabled"] != true && priorStatePath != null)
+                if (!forceDisabled && priorStatePath != null)
                     actual = enabled + (priorStatePath.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase) ? ".disabled" : "");
             }
             if (found != null) handled.Add(found);
@@ -163,13 +170,13 @@ public sealed partial class PackUpdater {
             string? localHash = found == null ? null : LocalHash(found);
             string? destinationHash = found != null && found.Equals(actual, StringComparison.OrdinalIgnoreCase) ? localHash : LocalHash(actual);
             string targetHash = (string)file["sha256"]!;
-            if (old == null && found != null && PackProtocol.ManagedMod(requested)) {
+            if (old == null && found != null && isMod) {
                 string enabled = PackProtocol.EnabledModPath(requested);
                 if ((baselineByPath.TryGetValue(enabled, out var baseline) || baselineByPath.TryGetValue(enabled + ".disabled", out baseline)) &&
                     localHash == (string?)baseline["sha256"]) old = baseline;
             }
             string? oldHash = (string?)old?["sha256"];
-            bool force = (bool?)file["force"] == true || (bool?)file["force_disabled"] == true || file["json_patch"] != null;
+            bool force = (bool?)file["force"] == true || forceDisabled || file["json_patch"] != null;
             string policy = (string)file["write_policy"]!;
             if (extraOld != null && !targets.Contains(extraOld) && !actions.Any(a => string.Equals((string?)a["path"], extraOld, StringComparison.OrdinalIgnoreCase)))
                 AddAt(plan, file, extraOld, "删除旧版本", LocalHash(extraOld), null, actual);
@@ -178,13 +185,13 @@ public sealed partial class PackUpdater {
                 plan.RetainedRecords.Add(old);
                 continue;
             }
-            if (found == null && old != null && policy == "unmodified" && !force) {
+            if (!isMod && found == null && old != null && policy == "unmodified" && !force) {
                 plan.Preserved.Add(requested + "（本地已移除）");
                 plan.RetainedRecords.Add(old);
                 continue;
             }
             if (localHash != null && (policy == "preserve" ||
-                policy == "unmodified" && !force && localHash != oldHash && localHash != targetHash)) {
+                (!isMod || old == null) && policy == "unmodified" && !force && localHash != oldHash && localHash != targetHash)) {
                 plan.Preserved.Add(found!);
                 continue;
             }
@@ -205,7 +212,14 @@ public sealed partial class PackUpdater {
                 continue;
             }
             if (destinationHash != targetHash) {
-                AddAt(plan, file, actual, file["json_patch"] != null ? "修改配置项" : force ? "强制更新" : destinationHash == null ? "新增" : "更新", destinationHash, file);
+                bool missingKnownMod = isMod && found == null && (old != null || repairing);
+                bool updating = destinationHash != null || isMod && found != null ||
+                    missingKnownMod && oldHash != null && oldHash != targetHash;
+                string kind = file["json_patch"] != null ? "修改配置项" : force ? "强制更新" :
+                    updating ? "更新" : missingKnownMod ? "补装" : "新增";
+                AddAt(plan, file, actual, kind, destinationHash, file);
+                if (missingKnownMod && plan.Changes.Last().Reason == "")
+                    plan.Changes.Last().Reason = "本地缺少旧文件，将安装目标版本。";
                 if (destinationHash != null && old != null && PartialConfig(plan, old) && force && file["json_patch"] == null)
                     plan.Changes.Last().Reason = "发布者要求整文件替换，将覆盖玩家的其他配置项。";
             }
@@ -232,7 +246,10 @@ public sealed partial class PackUpdater {
                 throw new IOException("禁用目标已存在且内容不同：" + path + ".disabled");
             AddAt(plan, action, found, disable ? "禁用" : force ? "强制删除" : "删除", hash, null, replacement);
         }
-        foreach (var old in previous.Where(f => Included(f, CleanupChoice(plan)))) {
+        if (repairing) {
+            plan.RetainedRecords.AddRange(previous.Where(f => !handled.Contains((string)f["path"]!)));
+        }
+        foreach (var old in previous.Where(f => !repairing && Included(f, CleanupChoice(plan)))) {
             string path = (string)old["path"]!;
             if (handled.Contains(path) || targets.Contains(path)) continue;
             string? found = FindLocal(path, LocalHash);
@@ -368,7 +385,7 @@ public sealed partial class PackUpdater {
             bool ready = false;
             foreach (string url in file["urls"]!.Select(item => (string)item!)) {
                 for (int attempt = 0; attempt < 2 && !ready; attempt++) {
-                    progress("正在从平台下载：" + change.Name);
+                    progress("正在从 " + PackChange.DownloadSourceFor(url) + " 下载：" + change.Name);
                     ready = Attempt(() => {
                         if (download != null) download(url, temporary, size);
                         else {
@@ -380,7 +397,7 @@ public sealed partial class PackUpdater {
                 if (ready) break;
             }
             if (!ready && file["entry"] != null) {
-                progress("正在读取整合包 ZIP：" + change.Name);
+                progress("正在读取" + PackChange.ArchiveDownloadSource + "：" + change.Name);
                 ready = Attempt(() => archive.Extract(file, temporary, Work("stage/compressed.part")));
             }
             if (!ready && options?.SelectLocalFile?.Invoke(change.Path, failure?.Message ?? "") is string source && source.Length > 0) {

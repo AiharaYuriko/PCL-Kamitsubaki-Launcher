@@ -390,8 +390,9 @@ Public Class ResourceProject
     ''' </summary>
     Public Shared Function FromProjectId(ProjectId As String, Platform As ResourcePlatforms) As ResourceProject
         If Not Platform.Flags.IsSingle Then Throw New ArgumentException($"必须指定单一平台，当前值为 {Platform}")
-        If Cache.ContainsKey(ProjectId) Then '存在缓存
-            Return Cache(ProjectId)
+        Dim Cached As ResourceProject = Nothing
+        If Cache.TryGetValue(ProjectId, Cached) AndAlso Cached.Platform = Platform Then
+            Return Cached
         ElseIf Platform = ResourcePlatforms.CurseForge Then 'CurseForge
             Return New ResourceProject(DlModRequest("https://api.curseforge.com/v1/mods/" & ProjectId)("data"))
         Else 'Modrinth
@@ -406,8 +407,9 @@ Public Class ResourceProject
         '获取缓存
         Dim MissingProjectIds As New List(Of String)
         For Each ProjectId In ProjectIds
-            If Cache.ContainsKey(ProjectId) Then
-                Yield Cache(ProjectId)
+            Dim Cached As ResourceProject = Nothing
+            If Cache.TryGetValue(ProjectId, Cached) AndAlso Cached.Platform = Platform Then
+                Yield Cached
             Else
                 MissingProjectIds.Add(ProjectId)
             End If
@@ -656,7 +658,7 @@ NoSubtitle:
     ''' <summary>
     ''' 工程 ID 对应的工程实例的缓存。不会保存到文件。
     ''' </summary>
-    Protected Friend Shared Cache As New Dictionary(Of String, ResourceProject)
+    Protected Friend Shared Cache As New System.Collections.Concurrent.ConcurrentDictionary(Of String, ResourceProject)
 
     ''' <summary>
     ''' 检查是否与某个 Project 是相同的工程，只是在不同的网站。

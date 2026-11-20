@@ -128,6 +128,7 @@ Public Class PageInstancePackUpdate
     Private Async Function CheckUpdate(Optional SelectedOverride As JArray = Nothing) As Task
         If Busy OrElse Choices.SelectedItem Is Nothing Then Return
         SetBusy(True) : Preview = Nothing
+        Dim IconRows As New List(Of (Item As MyLocalModItem, Sources As JArray))
         Try
             Dim Selection = CType(CType(Choices.SelectedItem, ComboBoxItem).Tag, JObject)
             Release = Await Task.Run(Function() PackUpdater.GetRelease(CType(Selection("pack"), JObject), CType(Selection("channel"), JObject), Mirror))
@@ -147,11 +148,21 @@ Public Class PageInstancePackUpdate
             LoadingComponents = False
             Dim Selected = SelectedComponents()
             Preview = Await Task.Run(Function() Updater.Plan(Release, Selected))
+            If Preview.IsCurrentArchiveRelease Then
+                LoadingComponents = True
+                For Each Box In Components.Children.OfType(Of MyCheckBox)()
+                    Box.Checked = Preview.Selected.Contains(CStr(Box.Tag))
+                    Box.IsEnabled = False
+                Next
+                LoadingComponents = False
+            End If
             Dim RuntimeMessage = If(Preview.IsApplied, "此版本已应用。", Await Task.Run(Function() ModPackUpdate.CheckRuntime(Target, Release)))
             Details.Children.Clear()
             Dim Rows = Preview.PreviewChanges().ToList()
             For Each Row In Rows
                 Dim Change = Row.Change
+                Dim DownloadSource = String.Join(" / ", Change.DownloadSources)
+                Dim SourceDescription = If(DownloadSource = "", "", "下载来源：" & DownloadSource)
                 If Change.IsMod Then
                     Dim Name = If(Change.Name.StartsWith("mods/", StringComparison.OrdinalIgnoreCase),
                         If(CStr(Change.File?("id")), If(CStr(Change.File?("fabric_id")), System.IO.Path.GetFileName(Change.Path))), Change.Name)
@@ -159,10 +170,15 @@ Public Class PageInstancePackUpdate
                     Dim Paths = String.Join("、", Row.PreviousPaths)
                     Dim Info = If(Paths = "", Change.Path, Paths & " → " & Change.Path)
                     If Change.Reason <> "" Then Info &= " · " & Change.Reason
-                    Details.Children.Add(New MyLocalModItem(Name, Kind, Info, Change.Icon) With {.ToolTip = Kind & " · " & Name & vbCrLf & Info})
+                    Dim ModItem As New MyLocalModItem(Name, Kind, Info, Change.Icon, DownloadSource) With {
+                        .ToolTip = Kind & " · " & Name & vbCrLf & Info & If(SourceDescription = "", "", vbCrLf & SourceDescription)}
+                    Details.Children.Add(ModItem)
+                    If Change.Icon = "" AndAlso Change.ModSources IsNot Nothing Then IconRows.Add((ModItem, Change.ModSources))
                     Continue For
                 End If
-                Dim Item As New MyListItem With {.Title = Change.Kind & " · " & Change.Name, .Info = Change.Path & If(Change.Reason = "", "", " · " & Change.Reason), .Height = 62,
+                Dim Item As New MyListItem With {.Title = Change.Kind & " · " & Change.Name,
+                    .Info = Change.Path & If(Change.Reason = "", "", " · " & Change.Reason) & If(SourceDescription = "", "", " · " & SourceDescription),
+                    .ToolTip = If(SourceDescription = "", Nothing, SourceDescription), .Height = 62,
                     .Logo = If(Change.Icon = "", "pack://application:,,,/images/Blocks/NeoForge.png", Change.Icon)}
                 Details.Children.Add(Item)
             Next
@@ -179,15 +195,54 @@ Public Class PageInstancePackUpdate
             ElseIf Updater.State("release_id") Is Nothing Then
                 Status.Text &= vbCrLf & "首次绑定：保留未识别的额外文件。"
             End If
-            If Not Preview.IsApplied Then Status.Text &= vbCrLf & If(Archived,
-                "点击更新将按预览安装、替换或移除文件。",
-                "点击更新将应用以上变化；受管文件会替换，额外文件保留。")
-            Update.Text = If(Preview.IsApplied, "已应用此版本", If(Preview.Changes.Count = 0 AndAlso Not Archived, "更新 / 检查修复", "更新整合包"))
+            If Not Preview.IsApplied Then Status.Text &= vbCrLf & If(Preview.IsCurrentArchiveRelease,
+                "点击修复模组将按预览补装或替换模组。",
+                If(Archived, "点击更新将按预览安装、替换或移除文件。",
+                   "点击更新将应用以上变化；受管文件会替换，额外文件保留。"))
+            Update.Text = If(Preview.IsApplied, "已应用此版本",
+                If(Preview.IsCurrentArchiveRelease, "修复模组", If(Preview.Changes.Count = 0 AndAlso Not Archived, "更新 / 检查修复", "更新整合包")))
         Catch ex As Exception
             Preview = Nothing : Status.Text = ex.Message
         Finally
             LoadingComponents = False : SetBusy(False)
         End Try
+        If Preview IsNot Nothing AndAlso IconRows.Count > 0 Then Await LoadPreviewIcons(Preview, IconRows)
+    End Function
+
+    Private Async Function LoadPreviewIcons(Plan As PackPlan, Rows As List(Of (Item As MyLocalModItem, Sources As JArray))) As Task
+        Dim Pending As New HashSet(Of MyLocalModItem)(Rows.Select(Function(Row) Row.Item))
+        For Each Platform In {ResourcePlatforms.Modrinth, ResourcePlatforms.CurseForge}
+            Dim PlatformName = If(Platform = ResourcePlatforms.Modrinth, "modrinth", "curseforge")
+            Dim IdPattern = If(Platform = ResourcePlatforms.Modrinth, "\A[A-Za-z0-9]{1,32}\z", "\A[1-9][0-9]{0,9}\z")
+            Dim ItemsByProject = (
+                From Row In Rows
+                Where Pending.Contains(Row.Item)
+                From Source In Row.Sources.OfType(Of JObject)()
+                Where Source.Value(Of String)("platform") = PlatformName
+                Let Id = Source.Value(Of String)("project")
+                Where Id IsNot Nothing AndAlso Id.RegexCheck(IdPattern)
+                Select Id, Row.Item).ToLookup(Function(Entry) Entry.Id, Function(Entry) Entry.Item, StringComparer.Ordinal)
+            Dim ProjectIds = ItemsByProject.Select(Function(Group) Group.Key).ToArray()
+            Const BatchSize As Integer = 50
+            For Start As Integer = 0 To ProjectIds.Length - 1 Step BatchSize
+                If Preview IsNot Plan Then Return
+                Dim Batch = ProjectIds.Skip(Start).Take(BatchSize).ToArray()
+                Dim Projects As List(Of ResourceProject)
+                Try
+                    Projects = Await Task.Run(Function() ResourceProject.FromProjectIds(Batch, Platform).ToList())
+                Catch ex As Exception
+                    Logger.Warn(ex, "获取整合包模组图标失败")
+                    Exit For
+                End Try
+                If Preview IsNot Plan Then Return
+                For Each Project In Projects
+                    If Project.Platform <> Platform OrElse String.IsNullOrEmpty(Project.LogoUrl) Then Continue For
+                    For Each Item In ItemsByProject(Project.Id)
+                        If Pending.Remove(Item) Then Item.SetPreviewProject(Project)
+                    Next
+                Next
+            Next
+        Next
     End Function
     Private Sub StartUpdate(IsRestore As Boolean)
         If Busy OrElse (Not IsRestore AndAlso (Preview Is Nothing OrElse Preview.IsApplied)) Then Return

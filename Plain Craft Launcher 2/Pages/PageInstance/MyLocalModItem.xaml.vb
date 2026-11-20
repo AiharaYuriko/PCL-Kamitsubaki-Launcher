@@ -320,14 +320,30 @@ Public Class MyLocalModItem
         InitializeComponent()
         LazyLoadBehavior.OnFirstEnterScrollViewerViewport(Me, AddressOf FirstEnterScrollViewerViewport)
     End Sub
-    Friend Sub New(Name As String, Status As String, Details As String, Logo As String)
+    Friend Sub New(Name As String, Status As String, Details As String, Logo As String, DownloadSource As String)
         InitializeComponent()
         Title = Name
         SubTitle = "  |  " & Status
         Description = Details
+        If DownloadSource <> "" Then
+            LabDownloadSource.Text = DownloadSource
+            LabDownloadSource.Visibility = Visibility.Visible
+        End If
         LabTitle.SetResourceReference(TextBlock.ForegroundProperty, "ColorBrush1")
         PathLogo.Source = If(String.IsNullOrEmpty(Logo), PathImage & "Icons/NoIcon.png", Logo)
+        If String.IsNullOrEmpty(Logo) Then
+            LazyLoadBehavior.OnFirstEnterScrollViewerViewport(Me, Sub()
+                HasEnteredViewport = True
+                PreviewProject?.ApplyLogoToMyImage(PathLogo)
+            End Sub)
+        End If
     End Sub
+    Private PreviewProject As ResourceProject
+    Friend Sub SetPreviewProject(Project As ResourceProject)
+        PreviewProject = Project
+        If HasEnteredViewport Then Project.ApplyLogoToMyImage(PathLogo)
+    End Sub
+
     Private HasEnteredViewport As Boolean = False
     Private Sub FirstEnterScrollViewerViewport()
         HasEnteredViewport = True

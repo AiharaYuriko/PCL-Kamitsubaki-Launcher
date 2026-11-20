@@ -12,7 +12,28 @@ public sealed class PackChange {
     public string Reason { get; set; } = "";
     public string? Before { get; set; }
     public JObject? File { get; set; }
+    public JArray? ModSources { get; internal set; }
     public bool IsMod => PackProtocol.ManagedMod(Path);
+    internal const string ArchiveDownloadSource = "整合包 ZIP";
+    public IEnumerable<string> DownloadSources {
+        get {
+            if (File == null) return Enumerable.Empty<string>();
+            var sources = (File["urls"] as JArray ?? new JArray()).Values<string>()
+                .Select(url => DownloadSourceFor(url!));
+            if (File["entry"] is JObject) sources = sources.Append(ArchiveDownloadSource);
+            return sources.Distinct(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+    internal static string DownloadSourceFor(string url) {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var address) || string.IsNullOrEmpty(address.Host))
+            return "直接下载";
+        string host = address.IdnHost.TrimEnd('.');
+        static bool Matches(string host, string domain) => host.Equals(domain, StringComparison.OrdinalIgnoreCase) ||
+            host.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase);
+        if (Matches(host, "modrinth.com")) return "Modrinth";
+        if (Matches(host, "forgecdn.net") || Matches(host, "curseforge.com")) return "CurseForge";
+        return host;
+    }
     internal string? DependsOn { get; set; }
     internal string? ToggleDestination => Kind switch {
         "禁用" => Path + ".disabled",
@@ -31,7 +52,9 @@ public sealed class PackPlan {
     internal Dictionary<string, List<JObject>> PriorForOptional { get; } = new(StringComparer.OrdinalIgnoreCase);
     internal Dictionary<string, string> FileTargets { get; } = new(StringComparer.OrdinalIgnoreCase);
     internal Dictionary<string, string[]> ModProjectsByHash { get; set; } = new(StringComparer.Ordinal);
-    public bool IsApplied => (string?)Release["schema"] == PackProtocol.ArchiveRelease && (long?)State["sequence"] == (long?)Release["release"]?["sequence"];
+    public bool IsCurrentArchiveRelease => (string?)Release["schema"] == PackProtocol.ArchiveRelease &&
+        (long?)State["sequence"] == (long?)Release["release"]?["sequence"];
+    public bool IsApplied => IsCurrentArchiveRelease && Changes.Count == 0;
     public long Bytes => Changes.Where(c => c.File != null).Sum(c => (long)c.File!["size"]!);
 
     public IEnumerable<(PackChange Change, string[] PreviousPaths)> PreviewChanges() {
@@ -153,7 +176,7 @@ public sealed partial class PackUpdater {
     }
     private static void Add(PackPlan plan, JObject item, string kind, string? hash, JObject? file) => plan.Changes.Add(new PackChange {
         Path = (string)item["path"]!, Name = (string?)item["display"]?["name"] ?? (string)item["path"]!, Icon = (string?)item["display"]?["icon_url"] ?? "",
-        Kind = kind, Before = hash, File = file, Reason = (string?)item["reason"] ?? ""
+        Kind = kind, Before = hash, File = file, ModSources = item["sources"] as JArray, Reason = (string?)item["reason"] ?? ""
     });
     public void Apply(PackPlan preview, Func<PackRuntime> prepareRuntime, Action<string> progress, Action<string, string, long>? download = null,
         PackDownloadOptions? options = null) {
@@ -178,7 +201,7 @@ public sealed partial class PackUpdater {
                 foreach (var address in file["urls"]!) {
                     string url = address.Value<string>()!;
                     try {
-                        progress("正在下载：" + change.Name);
+                        progress("正在从 " + PackChange.DownloadSourceFor(url) + " 下载：" + change.Name);
                         if (download != null) download(url, target, (long)file["size"]!);
                         else { using var output = File.Create(target); PackProtocol.Download(url, output, (long)file["size"]!, bytes => progress($"{change.Name}：{bytes / 1024:N0} / {(long)file["size"]! / 1024:N0} KB")); }
                         if (new FileInfo(target).Length != (long)file["size"]! || PackProtocol.HashFile(target) != (string?)file["sha256"]) throw new IOException("下载文件校验失败：" + change.Path);
@@ -188,14 +211,15 @@ public sealed partial class PackUpdater {
                 if (error != null) throw error;
                 staged[change] = target;
             }
+            var changes = plan.Changes.Where(c => !skipped.Contains(c.Path) &&
+                (c.DependsOn == null || !skipped.Contains(c.DependsOn))).ToList();
+            if (plan.IsCurrentArchiveRelease && changes.Count == 0) { progress("没有可应用的模组修复。"); return; }
             progress("正在准备游戏运行环境……"); var runtime = prepareRuntime();
             if (plan.Changes.Count == 0 && runtime.Paths.Count == 0 && (string?)plan.State["release_id"] == (string?)plan.Release["release"]!["id"] &&
                 new HashSet<string>((plan.State["selected"] as JArray ?? new JArray()).Select(item => item.Value<string>()!)).SetEquals(plan.Selected)) {
                 progress("已是最新，文件检查通过。"); return;
             }
             if (Signature(Plan(preview.Release, preview.Selected, plan.ModProjectsByHash)) != Signature(plan)) throw new IOException("下载期间本地文件发生变化，请重新检查。");
-            var changes = plan.Changes.Where(c => !skipped.Contains(c.Path) &&
-                (c.DependsOn == null || !skipped.Contains(c.DependsOn))).ToList();
             var paths = changes.Select(c => c.Path).Concat(changes.Select(c => c.ToggleDestination).OfType<string>()).Concat(runtime.Paths).Append(".pcl-update/state.json").Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             if (paths.Any(p => p.StartsWith(".pcl-update/", StringComparison.OrdinalIgnoreCase) && p != ".pcl-update/state.json")) throw new IOException("运行环境请求修改更新器内部文件。");
             string pending = Work("pending");

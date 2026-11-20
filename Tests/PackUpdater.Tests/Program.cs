@@ -239,17 +239,28 @@ internal static partial class Program {
             var files = publisher.Scan(PackPublisher.DefaultFolders);
             foreach (var file in files.Where(f => f.Category == "mod")) {
                 file.EmbedMod = true;
-                file.Urls.Add("https://example.com/platform");
+                file.Urls.Add(file.Path == "mods/new1.jar" ? "https://cdn.modrinth.com/data/test/first.jar" :
+                    file.Path == "mods/new2.jar" ? "https://mediafilez.forgecdn.net/files/test/second.jar" : "https://example.com/platform");
             }
             var release = publisher.Build(Details(), files, 1, zip, "https://example.com");
             var updater = new PackUpdater(player);
             var preview = updater.Plan(release, Array.Empty<string>());
             Assert(preview.BaselineMatches == 1 && preview.Changes.Count == 3, "Reused file should not be downloaded");
+            var rows = preview.Changes.ToDictionary(change => change.Path);
+            Assert(rows["mods/new1.jar"].DownloadSources.SequenceEqual(new[] { "Modrinth", "整合包 ZIP" }) &&
+                rows["mods/new2.jar"].DownloadSources.SequenceEqual(new[] { "CurseForge", "整合包 ZIP" }) &&
+                rows["config/empty.toml"].DownloadSources.SequenceEqual(new[] { "整合包 ZIP" }), "Incorrect download sources or priority in the preview");
+            Assert(PackChange.DownloadSourceFor("https://cdn.modrinth.com.example.org/file") == "cdn.modrinth.com.example.org" &&
+                !new PackChange { Kind = "删除" }.DownloadSources.Any(), "Custom hosts or local-only changes should not be attributed to a platform");
             int platform = 0, ranges = 0; long bytes = 0;
-            updater.Apply(preview, () => new PackRuntime(), _ => { },
+            var messages = new List<string>();
+            updater.Apply(preview, () => new PackRuntime(), messages.Add,
                 (_, _, _) => { platform++; throw new IOException("platform offline"); },
                 new PackDownloadOptions { DownloadRange = LocalRanges(zip, size => { ranges++; bytes += size; }) });
             Assert(platform == 4 && ranges == 2 && bytes < new FileInfo(zip).Length, "Fallback downloaded more than the two ZIP slices");
+            Assert(messages.Any(m => m.StartsWith("正在从 Modrinth 下载", StringComparison.Ordinal)) &&
+                messages.Any(m => m.StartsWith("正在从 CurseForge 下载", StringComparison.Ordinal)) &&
+                messages.Any(m => m.StartsWith("正在读取整合包 ZIP", StringComparison.Ordinal)), "Progress did not show the attempted sources");
             Assert(System.IO.File.ReadAllText(Path.Combine(player, "mods/new1.jar")) == "first" &&
                 System.IO.File.ReadAllText(Path.Combine(player, "mods/new2.jar")) == "second", "Archive data was not installed");
             Assert(System.IO.File.Exists(Path.Combine(player, "config/empty.toml")), "Empty ZIP member was not installed");
@@ -565,11 +576,53 @@ internal static partial class Program {
                 foreach (var candidate in candidates.Where(file => file.Path == oldPlatform)) candidate.Sources.Add(Source());
             });
             var plan = updater.Plan(release, Array.Empty<string>());
-            Assert(plan.PreviewChanges().Single(row => row.Change.Path == platform).PreviousPaths.SequenceEqual(new[] { oldPlatform }), "Platform fallback missed renamed file");
+            var platformPreview = plan.PreviewChanges().Single(row => row.Change.Path == platform);
+            Assert(platformPreview.PreviousPaths.SequenceEqual(new[] { oldPlatform }), "Platform fallback missed renamed file");
+            Assert((string?)platformPreview.Change.ModSources?.Single()["project"] == "Library1", "The preview lost the project ID used to resolve its icon");
             updater.Apply(plan, () => new PackRuntime(), _ => { }, options: new PackDownloadOptions { DownloadRange = LocalRanges(zip) });
             Assert(lookups == 1 && File.Exists(Path.Combine(player, fabric)) && !File.Exists(Path.Combine(player, oldFabric)) &&
                 !File.Exists(Path.Combine(player, oldPlatform)) && File.Exists(Path.Combine(player, "mods/forge.jar")) &&
                 File.Exists(Path.Combine(player, "mods/unknown.jar")), "Incorrect layered identification or preview lookup reuse");
+        });
+        Test("reinstalls missing Mods and updates disabled copies on upgrade and repair", root => {
+            string author = Path.Combine(root, "author"), player = Path.Combine(root, "player"), zip = Path.Combine(root, "pack.zip");
+            const string upgraded = "mods/upgrade.jar.disabled", unchanged = "mods/unchanged.jar", config = "config/player.toml";
+            const string playerMod = "mods/player.jar", disabled = playerMod + ".disabled";
+            Write(author, upgraded, "old mod");
+            Write(author, unchanged, "unchanged mod");
+            Write(author, playerMod, "baseline mod");
+            Write(author, config, "old config");
+            var publisher = new PackPublisher(author);
+            publisher.SaveBaseline(publisher.Scan(PackPublisher.DefaultFolders));
+            Write(author, upgraded, "new mod");
+            Write(author, playerMod, "published player mod");
+            Write(author, config, "new config");
+            Write(player, disabled, "locally installed version");
+            var files = publisher.Scan(PackPublisher.DefaultFolders);
+            foreach (var file in files.Where(file => file.Category == "mod")) file.EmbedMod = true;
+            var release = publisher.Build(Details(), files, 1, zip, "https://example.com");
+            var updater = new PackUpdater(player);
+            var plan = updater.Plan(release, Array.Empty<string>());
+            var changes = plan.PreviewChanges().Select(row => row.Change).ToDictionary(change => change.Path);
+            Assert(changes[upgraded].Kind == "更新" && changes[unchanged].Kind == "补装", "Both missing Mods should be installed");
+            Assert(changes[disabled].Kind == "更新" && !changes.ContainsKey(playerMod), "Existing disabled Mod should update in place");
+            Assert(plan.Preserved.Single().StartsWith(config, StringComparison.Ordinal), "Missing player config should be preserved");
+            void Install(PackPlan pending) => updater.Apply(pending, () => new PackRuntime(), _ => { },
+                options: new PackDownloadOptions { DownloadRange = LocalRanges(zip) });
+            Install(plan);
+            Assert(File.ReadAllText(Path.Combine(player, upgraded)) == "new mod", "The new Mod should be installed at its published disabled path");
+            Assert(File.ReadAllText(Path.Combine(player, disabled)) == "published player mod", "A local disabled Mod should stay disabled");
+
+            File.Delete(Path.Combine(player, unchanged));
+            Write(player, disabled, "locally installed version");
+            Write(player, config, "player config created after the release");
+            var repair = updater.Plan(release, Array.Empty<string>());
+            Assert(repair.IsCurrentArchiveRelease && !repair.IsApplied &&
+                new HashSet<string>(repair.Changes.Select(change => change.Path)).SetEquals(new[] { unchanged, disabled }),
+                "Repair of the applied release should only restore missing or mismatched Mods");
+            Install(repair);
+            Assert(updater.Plan(release, Array.Empty<string>()).IsApplied &&
+                File.ReadAllText(Path.Combine(player, config)) == "player config created after the release", "Repair should leave configs alone");
         });
         Test("skipped optional upgrade remains managed until next release", root => {
             string author = Path.Combine(root, "author"), player = Path.Combine(root, "player"), zip = Path.Combine(root, "pack.zip");
