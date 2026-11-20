@@ -6,17 +6,19 @@
 
 `Plain Craft Launcher 2/PCL.Online.json` 会嵌入 EXE，公开源码中的 `MicrosoftClientId` 留空。在 GitHub 仓库 Settings → Secrets and variables → Actions 中设置 `CLIENT_ID`；手动运行 Build 工作流时，它通过环境变量传给 `scripts/Set-BuildClientId.ps1`，仅修改构建工作区中的配置。缺少或无效的 ID 会使构建提前失败。
 
-本地调试可设置环境变量 `PCL_MS_CLIENT_ID`。本地打包在设置该变量后运行 `./scripts/Build-Launcher.ps1 -Configuration Release`；脚本负责注入、完整 WPF 编译，并在退出时自动恢复源码配置。玩家使用构建后的 EXE 无需设置环境变量。EXE 同目录的同名 JSON 可整体覆盖嵌入配置（应包含全部字段）；环境变量优先级最高，修改后重启生效。
+本地调试可设置环境变量 `PCL_MS_CLIENT_ID`。本地打包在设置该变量后运行 `./scripts/Build-Launcher.ps1 -Configuration Release`；脚本负责注入、完整 WPF 编译，并在退出时自动恢复源码配置。玩家使用构建后的 EXE 无需设置环境变量。EXE 同目录的同名 JSON 可整体覆盖嵌入配置（应包含全部字段）；环境变量优先于 JSON 中的对应字段。这两种配置修改后重启生效。
 
 | JSON 字段 | 环境变量 | 含义 |
 | --- | --- | --- |
 | MicrosoftClientId | PCL_MS_CLIENT_ID | 发布者自己的微软应用 ID；不是 Client Secret |
 | ProductId | PCL_PRODUCT_ID | 定制版身份，默认 kamitsubaki-pcl |
 | UpdateUrl | PCL_UPDATE_URL | GitHub 备用更新清单。设置环境变量可单独指定更新源 |
-| S3UpdateUrl | PCL_S3_UPDATE_URL | 优先使用的 Worker 更新清单地址，可留空关闭 S3 线路 |
+| S3UpdateUrl | PCL_S3_UPDATE_URL | 默认 Worker 更新清单地址 |
 | AnnouncementUrl | PCL_ANNOUNCEMENT_URL | 公告清单的公开 HTTPS 地址 |
 
 MicrosoftClientId 由构建流程注入，Minecraft 应用审核与真实登录测试待完成。启动器优先读取 S3 更新清单，清单不可用或未报告新版时检查 GitHub。如果 S3 下载或校验失败，会用同一份清单中的 GitHub 地址下载并校验相同版本。公告地址可自行配置。微软应用需支持个人账号设备代码登录及 Minecraft 服务访问。
+
+在「设置 → 其他 → 启动器 → S3 更新线路」可以填写启动器更新清单的完整 HTTPS 地址。S3 默认启用，取消勾选后使用 GitHub。「恢复默认」清除自定义地址并恢复发布者配置的线路，同时保留开关状态。若设置了 `PCL_UPDATE_URL`，启动器继续使用该变量指定的单独更新源。
 
 更新和公告可以放在已有对象存储的独立目录，例如 `launcher/update.json` 和 `launcher/announcements.json`，不要覆盖整合包更新清单。先发布完整、可独立运行的 EXE，再发布清单。不支持 ZIP、差分包或多文件部署；需要随 EXE 分发依赖的构建不能使用此更新方式。每次发布递增 `ModBase.vb` 中的版本名及 VersionCode，同步 `AssemblyInfo.vb` 的文件版本，并在 `PCL.ReleaseNotes.json` 中添加正式版版本码、版本名和用户可读的更新说明。启动后的升级弹窗和下载前的更新清单共用这些说明。Release 构建自动生成 `update.json`；将它与同次构建的 `PCL-Kamitsubaki.exe` 和 `SHA256SUMS.txt` 一起发布到标签 `v<文件版本>` 的最新正式 Release。早期定制版可设置 `PCL_UPDATE_URL=https://github.com/AiharaYuriko/PCL-Kamitsubaki-Launcher/releases/latest/download/update.json` 并重启后检查更新。
 

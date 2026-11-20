@@ -30,11 +30,15 @@ Friend Module ModOnline
         End If
     End Sub
 
-    Private Function Https(Value As String) As String
+    Friend Function ParseHttps(Value As String) As Uri
         Dim Address As Uri = Nothing
-        If Not Uri.TryCreate(Value, UriKind.Absolute, Address) OrElse Address.Scheme <> Uri.UriSchemeHttps OrElse Address.UserInfo <> "" Then
-            Throw New Exception("联网配置中的地址必须是 HTTPS URL。")
-        End If
+        If Not Uri.TryCreate(Value, UriKind.Absolute, Address) OrElse Address.Scheme <> Uri.UriSchemeHttps OrElse Address.UserInfo <> "" Then Return Nothing
+        Return Address
+    End Function
+
+    Private Function Https(Value As String) As String
+        Dim Address = ParseHttps(Value)
+        If Address Is Nothing Then Throw New Exception("联网配置中的地址必须是 HTTPS URL。")
         Return Address.AbsoluteUri
     End Function
 
@@ -44,10 +48,22 @@ Friend Module ModOnline
         Return JObject.Parse(NetRequestByClientRetry(Https(Address)))
     End Function
 
+    Friend Function DefaultOnlineUpdateMirrorUrl() As String
+        Return OnlineSetting("S3UpdateUrl", "PCL_S3_UPDATE_URL")
+    End Function
+
+    Private Function OnlineUpdateMirrorEnabled() As Boolean
+        Return Settings.Get(Of Boolean)("SystemUpdateS3Enabled") AndAlso
+            String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("PCL_UPDATE_URL"))
+    End Function
+
     Private Function ReadUpdate(Optional CheckBoth As Boolean = False) As JObject
         Dim GitHubUrl = OnlineSetting("UpdateUrl", "PCL_UPDATE_URL")
-        Dim MirrorUrl = If(String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("PCL_UPDATE_URL")),
-                           OnlineSetting("S3UpdateUrl", "PCL_S3_UPDATE_URL"), "")
+        Dim MirrorUrl = ""
+        If OnlineUpdateMirrorEnabled() Then
+            Dim CustomUrl = Settings.Get(Of String)("SystemUpdateS3Url").Trim()
+            MirrorUrl = If(CustomUrl = "", DefaultOnlineUpdateMirrorUrl(), CustomUrl)
+        End If
         Dim Mirror As JObject = Nothing
         If MirrorUrl <> "" Then
             Try
@@ -127,7 +143,7 @@ Friend Module ModOnline
     Private Sub DownloadVerified(Data As JObject, Target As String, Optional Loader As LoaderBase = Nothing)
         Dim Hash = UpdateHash(Data)
         Dim MirrorUrl = Data.Value(Of String)("mirrorDownloadUrl")
-        If Not String.IsNullOrWhiteSpace(MirrorUrl) Then
+        If OnlineUpdateMirrorEnabled() AndAlso Not String.IsNullOrWhiteSpace(MirrorUrl) Then
             Try
                 DownloadUpdateFile(MirrorUrl, Hash, Target, Loader)
                 Return

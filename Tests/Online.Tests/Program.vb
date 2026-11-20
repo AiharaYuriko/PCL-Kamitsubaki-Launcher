@@ -105,6 +105,29 @@ Module Program
         OnlineCheck(True)
         Assert(DownloadUrls.SequenceEqual({MirrorFile}), "S3 did not take precedence")
 
+        Const CustomManifest = "https://custom-s3.example/update.json"
+        Const CustomFile = "https://custom-s3.example/launcher.exe"
+        Dim Custom = CType(Mirror.DeepClone(), JObject)
+        Custom("mirrorDownloadUrl") = CustomFile
+        Responses(CustomManifest) = Custom.ToString()
+        Settings.Values("SystemUpdateS3Url") = " " & CustomManifest & " "
+        DownloadUrls.Clear()
+        OnlineCheck(True)
+        Assert(DownloadUrls.SequenceEqual({CustomFile}), "Custom S3 address was ignored")
+
+        Settings.Values("SystemUpdateS3Enabled") = False
+        Dim Before = Calls
+        DownloadUrls.Clear()
+        OnlineCheck(True)
+        Assert(Calls = Before + 1 AndAlso DownloadUrls.SequenceEqual({Update.Value(Of String)("downloadUrl")}),
+               "Disabled S3 still accessed the mirror")
+
+        Settings.Values("SystemUpdateS3Enabled") = True
+        Settings.Values("SystemUpdateS3Url") = ""
+        DownloadUrls.Clear()
+        OnlineCheck(True)
+        Assert(DownloadUrls.SequenceEqual({MirrorFile}), "Clearing the custom address did not restore the default mirror")
+
         CorruptDownloadUrl = MirrorFile
         DownloadUrls.Clear()
         OnlineCheck(True)
@@ -169,7 +192,9 @@ Public Module Logger
     End Sub
 End Module
 Public Module Settings
-    Public Values As New Dictionary(Of String, Integer) From {{"SystemSystemUpdate", 0}, {"SystemSystemActivity", 0}}
+    Public Values As New Dictionary(Of String, Object) From {
+        {"SystemSystemUpdate", 0}, {"SystemSystemActivity", 0}, {"SystemUpdateS3Enabled", True}, {"SystemUpdateS3Url", ""}
+    }
     Public Function [Get](Of T)(Key As String) As T
         Return CType(CObj(Values(Key)), T)
     End Function

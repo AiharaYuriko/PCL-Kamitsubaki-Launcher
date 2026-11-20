@@ -19,12 +19,16 @@ Public Class PageSetupSystem
         IsLoaded = True
 
         AniControlEnabled += 1
+        TextSystemUpdateS3Url.ValidateRules.Add(New ValidateFunc(
+            Function(Value) If(String.IsNullOrWhiteSpace(Value) OrElse ParseHttps(Value.Trim()) IsNot Nothing,
+                               "", "请输入完整的 HTTPS 更新清单地址。")))
         Reload()
         SliderLoad()
         AniControlEnabled -= 1
 
     End Sub
     Public Sub Reload()
+        TextSystemUpdateS3Url.HintText = DefaultOnlineUpdateMirrorUrl()
         SettingService.RefreshSettings(Me)
     End Sub
     Public Sub Reset()
@@ -101,6 +105,10 @@ Public Class PageSetupSystem
     End Sub
     Private Sub BtnSystemUpdate_Click(sender As Object, e As EventArgs) Handles BtnSystemUpdate.Click
         UpdateCheckByButton()
+    End Sub
+    Private Sub BtnSystemUpdateS3Reset_Click(sender As Object, e As MouseButtonEventArgs) Handles BtnSystemUpdateS3Reset.Click
+        SettingService.ResetSettings(TextSystemUpdateS3Url)
+        SettingService.RefreshSettings(TextSystemUpdateS3Url)
     End Sub
     ''' <summary>
     ''' 启动器是否已经是最新版？
