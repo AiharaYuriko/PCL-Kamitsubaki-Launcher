@@ -154,7 +154,7 @@ Public Class PageInstancePackUpdate
                 Dim Change = Row.Change
                 If Change.IsMod Then
                     Dim Name = If(Change.Name.StartsWith("mods/", StringComparison.OrdinalIgnoreCase),
-                        If(CStr(Change.File?("id")), CStr(Change.File?("fabric_id")), System.IO.Path.GetFileName(Change.Path)), Change.Name)
+                        If(CStr(Change.File?("id")), If(CStr(Change.File?("fabric_id")), System.IO.Path.GetFileName(Change.Path))), Change.Name)
                     Dim Kind = If(Row.PreviousPaths.Length > 0 AndAlso Change.Kind = "新增", "更新", Change.Kind)
                     Dim Paths = String.Join("、", Row.PreviousPaths)
                     Dim Info = If(Paths = "", Change.Path, Paths & " → " & Change.Path)
