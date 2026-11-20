@@ -3,8 +3,8 @@ import json
 import os
 from pathlib import Path
 import re
-from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import boto3
 from botocore.config import Config
@@ -103,9 +103,12 @@ def main():
             raise
 
     manifest["mirrorDownloadUrl"] = f"{WORKER_URL}/{exe_path}"
+    request = Request(manifest["mirrorDownloadUrl"], headers={"User-Agent": "PCL GitHub release sync"})
     try:
-        with urlopen(manifest["mirrorDownloadUrl"], timeout=30) as response:
+        with urlopen(request, timeout=30) as response:
             digest = hashlib.file_digest(response, "sha256").hexdigest()
+    except HTTPError as error:
+        raise RuntimeError(f"The launcher EXE download through the signing Worker returned HTTP {error.code}.") from None
     except (URLError, OSError):
         raise RuntimeError("The launcher EXE could not be read through the signing Worker.") from None
     if digest != manifest["sha256"].lower():
