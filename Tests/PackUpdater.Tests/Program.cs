@@ -1,6 +1,7 @@
 using Newtonsoft.Json.Linq;
 using PCL.Modpack;
 using System.IO.Compression;
+using System.Security.Cryptography;
 using System.Text;
 
 internal static partial class Program {
@@ -79,21 +80,112 @@ internal static partial class Program {
             updater.Bind(PackMirror.DefaultPrimaryAddress, "test", "stable");
             Assert((string?)new PackUpdater(root).Binding["mirror_url"] == "", "Clearing the mirror should survive reopening");
         });
-        Test("publisher credentials can be reopened before publishing and cleared separately", root => {
-            var publisher = new PackPublisher(root);
-            publisher.SaveCredentials("", "");
-            publisher.SaveCredentials("r2-access", "");
-            publisher.SaveCredentials("", "mirror-secret", mirror: true);
-            var reopened = new PackPublisher(root);
-            Assert((string?)reopened.ReadCredentials()["access"] == "r2-access", "R2 edit was lost");
-            Assert((string?)reopened.ReadCredentials(mirror: true)["secret"] == "mirror-secret", "Mirror edit was lost");
-            string unfinished = publisher.ProjectFile("credentials.json") + ".tmp";
-            File.Copy(publisher.ProjectFile("credentials.json"), unfinished);
-            reopened.SaveCredentials("", "");
-            Assert(!File.Exists(unfinished), "Unfinished credential write was not removed");
-            Assert(!publisher.ReadCredentials().HasValues && publisher.ReadCredentials(mirror: true).HasValues, "Credential stores must be independent");
-            reopened.SaveCredentials("", "", mirror: true);
-            Assert(!publisher.ReadCredentials(mirror: true).HasValues, "Mirror credential was not removed");
+        Test("publisher credentials share across instances and migrate by storage target", root => {
+            string store = Path.Combine(root, "shared");
+            var publisher = new PackPublisher(Path.Combine(root, "first"), store);
+            var reopened = new PackPublisher(Path.Combine(root, "second"), store);
+            string account = new string('a', 32);
+            string r2 = PackPublisher.CredentialTarget(account, "pack-bucket")!;
+            string other = PackPublisher.CredentialTarget(account, "other-bucket")!;
+            string mirror = PackPublisher.CredentialTarget("", "pack-bucket", mirror: true)!;
+
+            void WriteLegacy(PackPublisher instance, string name, string access) {
+                string path = instance.ProjectFile(name);
+                var data = Encoding.UTF8.GetBytes(new JObject { ["access"] = access, ["secret"] = "legacy-secret" }.ToString());
+                var encrypted = ProtectedData.Protect(data, null, DataProtectionScope.CurrentUser);
+                PackUpdater.Atomic(path, new JObject { ["encrypted"] = Convert.ToBase64String(encrypted) });
+            }
+
+            WriteLegacy(publisher, "credentials.json", "legacy-r2");
+            WriteLegacy(publisher, "mirror-credentials.json", "legacy-mirror");
+            publisher.MigrateLegacyCredentials(r2);
+            publisher.MigrateLegacyCredentials(mirror, mirror: true);
+            Assert((string?)reopened.ReadCredentials(r2)["access"] == "legacy-r2", "R2 migration should be visible from another instance");
+            Assert((string?)reopened.ReadCredentials(mirror)["access"] == "legacy-mirror", "Mirror migration should be visible from another instance");
+            Assert(!File.Exists(publisher.ProjectFile("credentials.json")) && !File.Exists(publisher.ProjectFile("mirror-credentials.json")),
+                "Migrated files should be removed");
+            Assert(!reopened.ReadCredentials(other).HasValues, "Other buckets should not inherit credentials");
+            Assert(!reopened.ReadCredentials(PackPublisher.CredentialTarget(new string('b', 32), "pack-bucket")).HasValues,
+                "Other accounts should not inherit credentials");
+
+            reopened.SaveCredentials(r2, "shared-r2", "");
+            WriteLegacy(publisher, "credentials.json", "older-r2");
+            publisher.MigrateLegacyCredentials(r2);
+            Assert((string?)publisher.ReadCredentials(r2)["access"] == "shared-r2", "Legacy migration should not overwrite shared credentials");
+            reopened.SaveCredentials(r2, "", "");
+            Assert(!publisher.ReadCredentials(r2).HasValues && publisher.ReadCredentials(mirror).HasValues, "Clearing one target should keep the other");
+
+            WriteLegacy(publisher, "credentials.json", "unknown-target");
+            publisher.MigrateLegacyCredentials(null);
+            publisher.MigrateLegacyCredentials(other);
+            Assert(File.Exists(publisher.ProjectFile("credentials.json")) && !publisher.ReadCredentials(other).HasValues,
+                "Legacy credentials with an unknown original target should not be assigned to a later target");
+        });
+        Test("publisher preview pairs renamed mods by ID, platform project, then path", root => {
+            string old = Path.Combine(root, "before");
+            string current = Path.Combine(root, "after");
+            const string metadata = "[[mods]]\nmodId=\"paired_mod\"";
+            void Jar(string instance, string path, string? toml = null) {
+                string full = Path.Combine(instance, path);
+                Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+                using var zip = new ZipArchive(File.Create(full), ZipArchiveMode.Create);
+                using var output = new StreamWriter(zip.CreateEntry(toml == null ? "payload" : "META-INF/neoforge.mods.toml").Open());
+                output.Write(toml ?? path);
+            }
+            Jar(old, "mods/identified-old.jar", metadata);
+            Jar(current, "mods/identified-new.jar", metadata);
+            Jar(old, "mods/platform-old.jar");
+            Jar(current, "mods/platform-new.jar");
+            Jar(old, "mods/platform-renamed-id-old.jar", "[[mods]]\nmodId=\"old_platform_id\"");
+            Jar(current, "mods/platform-renamed-id-new.jar", "[[mods]]\nmodId=\"new_platform_id\"");
+            Jar(old, "mods/same.jar");
+            Jar(current, "mods/same.jar.disabled");
+            Jar(old, "mods/duplicate-old.jar");
+            Jar(current, "mods/duplicate-a.jar");
+            Jar(current, "mods/duplicate-b.jar");
+            Write(old, "config/options.json", "{\"old\":true}");
+            Write(current, "config/options.json", "{\"old\":false}");
+            var folders = new[] { "mods", "config" };
+            var publisher = new PackPublisher(current);
+            void Resolve(IEnumerable<PackPublishFile> files) {
+                foreach (var file in files.Where(f => f.Category == "mod")) {
+                    Assert(File.Exists(file.LocalPath), "Platform matching requires real old or new JAR bytes");
+                    if (file.Path.StartsWith("mods/platform") || file.Path.StartsWith("mods/duplicate")) {
+                        string project = file.Path.StartsWith("mods/platform-renamed-id") ? "RenamedId" :
+                            file.Path.StartsWith("mods/platform") ? "Platform" : "Duplicate";
+                        file.Sources.Add(new JObject { ["platform"] = "modrinth", ["project"] = project, ["version"] = "Version" });
+                    }
+                }
+            }
+            var legacy = publisher.ImportBaselineFolder("Legacy", old, folders, Array.Empty<string>());
+            var folder = publisher.ImportBaselineFolder("Folder", old, folders, Array.Empty<string>(), Resolve);
+            string archivePath = Path.Combine(root, "old.zip");
+            ZipFile.CreateFromDirectory(old, archivePath);
+            var archive = publisher.ImportBaselineZip("Archive", archivePath, folders, Array.Empty<string>(), Resolve);
+            Assert(publisher.Scan(folders, baselineId: legacy.Id, resolveModSources: Resolve)
+                .Single(f => f.Path == "mods/platform-new.jar").Change == "新增", "Old baselines should work without platform metadata");
+            publisher.SetBaselinePreviewSource(legacy.Id, old);
+            foreach (var baseline in new[] { folder, archive, legacy }) {
+                var rows = publisher.Scan(folders, baselineId: baseline.Id, resolveModSources: Resolve).ToDictionary(f => f.Path);
+                void CheckPair(string path, string previous) {
+                    Assert(rows[path].Change == "更新" && rows[path].PreviousPath == previous && !rows.ContainsKey(previous), path);
+                }
+                CheckPair("mods/identified-new.jar", "mods/identified-old.jar");
+                CheckPair("mods/platform-new.jar", "mods/platform-old.jar");
+                CheckPair("mods/platform-renamed-id-new.jar", "mods/platform-renamed-id-old.jar");
+                CheckPair("mods/same.jar.disabled", "mods/same.jar");
+                Assert(rows["config/options.json"].Change == "更新", "Unrelated files should compare by path");
+                Assert(rows["mods/duplicate-old.jar"].Change == "已移出" && rows["mods/duplicate-a.jar"].Change == "新增" &&
+                    rows["mods/duplicate-b.jar"].Change == "新增", "Ambiguous projects should not be paired");
+                var baselineDocument = publisher.BaselineDocument(baseline.Id);
+                Assert((baselineDocument["mod_projects"] is JObject) == (baseline.Id != legacy.Id) &&
+                    baselineDocument["files"]!.All(f => f["mod_projects"] == null),
+                    "Preview metadata should stay outside the player baseline records");
+            }
+            Write(old, "mods/platform-old.jar", "wrong baseline bytes");
+            Assert(publisher.Scan(folders, baselineId: legacy.Id, resolveModSources: Resolve)
+                .Single(f => f.Path == "mods/platform-new.jar").Change == "新增",
+                "The on-disk old JAR must still match the selected baseline hash");
         });
         Test("mirror signing preflight requires the configured private bucket", _ => {
             var settings = new PackS3MirrorSettings { Bucket = "custom-pack-bucket" };

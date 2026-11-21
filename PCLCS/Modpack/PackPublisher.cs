@@ -1,6 +1,7 @@
 using System.IO;
 using System.IO.Compression;
 using System.Security.Cryptography;
+using System.Threading;
 
 namespace PCL.Modpack;
 
@@ -13,6 +14,7 @@ public sealed class PackPublishFile {
     public long Size { get; set; }
     public string Category { get; set; } = "file";
     public string Change { get; set; } = "";
+    public string? PreviousPath { get; set; }
     public string Operation { get; set; } = PackPublisher.Automatic;
     public string JsonKeys { get; set; } = "";
     public string Platform { get; set; } = "";
@@ -49,10 +51,24 @@ public sealed class PackPublisher(string root) {
     private static readonly DateTimeOffset ZipDate = new(2000, 1, 1, 0, 0, 0, TimeSpan.Zero);
     private const string LegacyBaselineId = "legacy";
     private const string LegacyBaselineName = "原有基线";
+    private const string BaselinePreviewSources = "baseline-preview-sources.json";
+    private readonly string? credentialDirectory;
+
+    internal PackPublisher(string root, string credentialDirectory) : this(root) {
+        this.credentialDirectory = credentialDirectory;
+    }
 
     internal string ProjectFile(string name) => PackProtocol.Safe(root, ".pcl-update/publisher/" + name, true);
     public JObject Settings => Read("settings.json");
     public void SaveSettings(JObject settings) => PackUpdater.Atomic(ProjectFile("settings.json"), settings);
+    public void SetBaselinePreviewSource(string baselineId, string source) {
+        if (!Directory.Exists(source) || !Directory.Exists(Path.Combine(source, "mods")))
+            throw new IOException("请选择包含 mods 文件夹的旧实例目录。");
+        BaselinePath(baselineId);
+        var sources = Read(BaselinePreviewSources);
+        sources[baselineId] = Path.GetFullPath(source);
+        PackUpdater.Atomic(ProjectFile(BaselinePreviewSources), sources);
+    }
     public bool HasBaseline => Baselines.Count != 0;
     public JObject Latest => Read("latest.json");
 
@@ -80,23 +96,97 @@ public sealed class PackPublisher(string root) {
         string suffix = "/" + ArchiveKey(hash);
         return archive.EndsWith(suffix, StringComparison.Ordinal) ? archive.Substring(0, archive.Length - suffix.Length) : null;
     }
-    public JObject ReadCredentials(bool mirror = false) {
-        var saved = (string?)Read(mirror ? "mirror-credentials.json" : "credentials.json")["encrypted"];
-        return saved == null ? new JObject() : PackProtocol.Parse(ProtectedData.Unprotect(Convert.FromBase64String(saved), null, DataProtectionScope.CurrentUser));
+    public static string? CredentialTarget(string account, string bucket, bool mirror = false) {
+        if (mirror) return PackS3MirrorSettings.ValidBucket(bucket) ? $"s3/{PackS3MirrorSettings.Host}/{bucket}" : null;
+        return PackR2Settings.ValidTarget(account, bucket) ? $"r2/{account}/{bucket}" : null;
     }
-    public void SaveCredentials(string access, string secret, bool mirror = false) {
-        string path = ProjectFile(mirror ? "mirror-credentials.json" : "credentials.json");
-        if (access.Length == 0 && secret.Length == 0) {
-            try {
-                File.Delete(path);
-                File.Delete(path + ".tmp");
-            }
-            catch (DirectoryNotFoundException) { }
-            return;
+
+    private string CredentialPath(string target) {
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (credentialDirectory == null && localAppData.Length == 0)
+            throw new IOException("无法定位当前 Windows 用户的本地应用数据目录。");
+        string directory = credentialDirectory ?? Path.Combine(localAppData, "PCL-Kamitsubaki", "publisher", "credentials");
+        return Path.Combine(directory, PackProtocol.Hash(Encoding.UTF8.GetBytes(target)) + ".json");
+    }
+
+    private static T WithCredentialLock<T>(string path, Func<T> action) {
+        string id = PackProtocol.Hash(Encoding.UTF8.GetBytes(Path.GetFullPath(path).ToUpperInvariant()));
+        using var mutex = new Mutex(false, @"Global\PCL-Kamitsubaki-publisher-" + id);
+        try {
+            if (!mutex.WaitOne(TimeSpan.FromSeconds(5)))
+                throw new IOException("等待发布凭据文件超时。");
         }
-        var bytes = PackR2Publisher.JsonBytes(new JObject { ["access"] = access, ["secret"] = secret });
-        var encrypted = ProtectedData.Protect(bytes, null, DataProtectionScope.CurrentUser);
+        catch (AbandonedMutexException) { }
+        try { return action(); }
+        finally { mutex.ReleaseMutex(); }
+    }
+
+    private static JObject DecryptCredentials(JObject document, byte[]? entropy) {
+        string encrypted = (string?)document["encrypted"] ?? throw new InvalidDataException("发布凭据文件格式无效。");
+        return PackProtocol.Parse(ProtectedData.Unprotect(Convert.FromBase64String(encrypted), entropy, DataProtectionScope.CurrentUser));
+    }
+
+    private static void WriteCredentials(string path, JObject value, byte[] entropy) {
+        var encrypted = ProtectedData.Protect(PackR2Publisher.JsonBytes(value), entropy, DataProtectionScope.CurrentUser);
         PackUpdater.Atomic(path, new JObject { ["encrypted"] = Convert.ToBase64String(encrypted) });
+    }
+
+    public JObject ReadCredentials(string? target) {
+        if (target == null) return new JObject();
+        string path = CredentialPath(target);
+        return WithCredentialLock(path, () => File.Exists(path)
+            ? DecryptCredentials(PackProtocol.Parse(File.ReadAllBytes(path)), Encoding.UTF8.GetBytes(target))
+            : new JObject());
+    }
+
+    public void SaveCredentials(string? target, string access, string secret) {
+        if (target == null) return;
+        string path = CredentialPath(target);
+        WithCredentialLock(path, () => {
+            if (access.Length == 0 && secret.Length == 0) {
+                DeleteCredentialFiles(path);
+            } else {
+                WriteCredentials(path, new JObject { ["access"] = access, ["secret"] = secret }, Encoding.UTF8.GetBytes(target));
+            }
+            return true;
+        });
+    }
+
+    public void MigrateLegacyCredentials(string? target, bool mirror = false) {
+        string legacy = ProjectFile(mirror ? "mirror-credentials.json" : "credentials.json");
+        if (!File.Exists(legacy)) return;
+        WithCredentialLock(legacy, () => {
+            if (!File.Exists(legacy)) return false;
+            var document = PackProtocol.Parse(File.ReadAllBytes(legacy));
+            // Record the original binding before allowing instance settings to change.
+            string? binding = (string?)document["target"];
+            string id = target == null ? "" : Path.GetFileNameWithoutExtension(CredentialPath(target));
+            if (binding == null) {
+                document["target"] = binding = id;
+                PackUpdater.Atomic(legacy, document);
+            }
+            if (target == null || binding != id) return false;
+
+            string path = CredentialPath(target);
+            return WithCredentialLock(path, () => {
+                var entropy = Encoding.UTF8.GetBytes(target);
+                var credentials = DecryptCredentials(document, null);
+                if (File.Exists(path))
+                    DecryptCredentials(PackProtocol.Parse(File.ReadAllBytes(path)), entropy);
+                else
+                    WriteCredentials(path, credentials, entropy);
+                DeleteCredentialFiles(legacy);
+                return true;
+            });
+        });
+    }
+
+    private static void DeleteCredentialFiles(string path) {
+        try {
+            File.Delete(path + ".tmp");
+            File.Delete(path);
+        }
+        catch (DirectoryNotFoundException) { }
     }
 
     public string GetImportPath(string source) {
@@ -127,10 +217,12 @@ public sealed class PackPublisher(string root) {
     private static IEnumerable<string> ScanFolders(IEnumerable<string> folders) => folders
         .Select(f => f.Trim().Replace('\\', '/').TrimEnd('/')).Where(f => f.Length != 0).Distinct(StringComparer.OrdinalIgnoreCase);
 
-    public List<PackPublishFile> Scan(IEnumerable<string> folders, bool compare = true, IEnumerable<string>? files = null, string? baselineId = null) =>
-        Scan(folders, compare, files, baselineId, includeMaps: true);
+    public List<PackPublishFile> Scan(IEnumerable<string> folders, bool compare = true, IEnumerable<string>? files = null,
+        string? baselineId = null, Action<IEnumerable<PackPublishFile>>? resolveModSources = null) =>
+        Scan(folders, compare, files, baselineId, includeMaps: true, resolveModSources);
 
-    private List<PackPublishFile> Scan(IEnumerable<string> folders, bool compare, IEnumerable<string>? files, string? baselineId, bool includeMaps) {
+    private List<PackPublishFile> Scan(IEnumerable<string> folders, bool compare, IEnumerable<string>? files, string? baselineId,
+        bool includeMaps, Action<IEnumerable<PackPublishFile>>? resolveModSources = null) {
         var result = new Dictionary<string, PackPublishFile>(StringComparer.OrdinalIgnoreCase);
         foreach (string file in files ?? Enumerable.Empty<string>()) {
             string path = file.Replace('\\', '/');
@@ -147,7 +239,8 @@ public sealed class PackPublisher(string root) {
             if ((bool?)map["file"] == true) Add(published, source);
             else Walk(source, published, Add);
         }
-        if (compare) AddChanges(result, baselineId);
+        resolveModSources?.Invoke(result.Values);
+        if (compare) AddChanges(result, baselineId, resolveModSources);
         return result.Values.OrderBy(f => f.Path, StringComparer.OrdinalIgnoreCase).ToList();
 
         void Add(string path, string full) {
@@ -176,14 +269,16 @@ public sealed class PackPublisher(string root) {
     public PackBaseline SaveBaseline(string name, IEnumerable<PackPublishFile> files) =>
         SaveNamedBaseline(name, InstanceName(root), VerifySnapshot(files));
 
-    public PackBaseline ImportBaselineFolder(string name, string source, IEnumerable<string> folders, IEnumerable<string> paths) {
+    public PackBaseline ImportBaselineFolder(string name, string source, IEnumerable<string> folders, IEnumerable<string> paths,
+        Action<IEnumerable<PackPublishFile>>? resolveModSources = null) {
         var old = new PackPublisher(source);
         var existingPaths = paths.Select(p => p.Replace('\\', '/')).Where(p => File.Exists(old.ResolveScanPath(p)));
-        var files = old.Scan(folders, compare: false, files: existingPaths, baselineId: null, includeMaps: false);
+        var files = old.Scan(folders, compare: false, files: existingPaths, baselineId: null, includeMaps: false, resolveModSources);
         return SaveNamedBaseline(name, InstanceName(source), old.VerifySnapshot(files));
     }
 
-    public PackBaseline ImportBaselineZip(string name, string source, IEnumerable<string> folders, IEnumerable<string> paths) {
+    public PackBaseline ImportBaselineZip(string name, string source, IEnumerable<string> folders, IEnumerable<string> paths,
+        Action<IEnumerable<PackPublishFile>>? resolveModSources = null) {
         using var stream = File.OpenRead(source);
         using var zip = new ZipArchive(stream, ZipArchiveMode.Read);
         // Platform archives can omit the actual Mod bytes needed for the baseline hashes.
@@ -215,7 +310,8 @@ public sealed class PackPublisher(string root) {
 
         var selectedFolders = ScanFolders(folders).ToArray();
         var selectedPaths = new HashSet<string>(paths.Select(p => p.Replace('\\', '/')), StringComparer.OrdinalIgnoreCase);
-        var snapshot = new List<JObject>();
+        var snapshot = new List<PackPublishFile>();
+        var modEntries = new List<(PackPublishFile File, ZipArchiveEntry Entry)>();
         foreach (var item in entries.Where(e => string.Equals(e.Prefix, prefix, StringComparison.OrdinalIgnoreCase))) {
             string path = item.Path;
             if (path.StartsWith("mods/", StringComparison.OrdinalIgnoreCase) && !PackProtocol.ManagedMod(path)) continue;
@@ -231,20 +327,44 @@ public sealed class PackPublisher(string root) {
                 var identity = ReadPrimaryMod(mod);
                 file.ModId = identity?.Id;
                 file.FabricMod = identity?.Fabric == true;
+                file.Category = "mod";
+                file.Size = item.Entry.Length;
+                if (resolveModSources != null) modEntries.Add((file, item.Entry));
             }
-            snapshot.Add(Snapshot(file));
+            snapshot.Add(file);
         }
+        if (modEntries.Count != 0 && resolveModSources != null) ResolveZipModSources(modEntries, resolveModSources);
         string instance = prefix.Length == 0 || prefix.Equals("overrides", StringComparison.OrdinalIgnoreCase)
             ? Path.GetFileNameWithoutExtension(source) : prefix.Split('/').Last();
         return SaveNamedBaseline(name, instance, snapshot);
     }
 
-    private IEnumerable<JObject> VerifySnapshot(IEnumerable<PackPublishFile> files) {
+    private static void ResolveZipModSources(List<(PackPublishFile File, ZipArchiveEntry Entry)> mods,
+        Action<IEnumerable<PackPublishFile>> resolveModSources) {
+        string temporary = Path.Combine(Path.GetTempPath(), "pcl-baseline-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporary);
+        try {
+            const int batchSize = 80;
+            for (int start = 0; start < mods.Count; start += batchSize) {
+                var batch = mods.Skip(start).Take(batchSize).ToArray();
+                for (int i = 0; i < batch.Length; i++) {
+                    var (file, entry) = batch[i];
+                    file.LocalPath = Path.Combine(temporary, i + ".jar");
+                    entry.ExtractToFile(file.LocalPath);
+                }
+                resolveModSources(batch.Select(mod => mod.File));
+                foreach (var mod in batch) File.Delete(mod.File.LocalPath);
+            }
+        }
+        finally { Directory.Delete(temporary, true); }
+    }
+
+    private IEnumerable<PackPublishFile> VerifySnapshot(IEnumerable<PackPublishFile> files) {
         var included = files.Where(f => f.LocalPath.Length > 0 && f.Category != "map" && f.Operation != Exclude).ToList();
         foreach (var file in included)
             if (!PackArchive.Matches(PackProtocol.Safe(root, file.Path), file.Size, file.Sha256))
                 throw new IOException("扫描后文件发生变化，请重新扫描：" + file.Path);
-        return included.Select(Snapshot);
+        return included;
     }
 
     private static string InstanceName(string path) => Path.GetFileName(Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar));
@@ -256,7 +376,7 @@ public sealed class PackPublisher(string root) {
         name != null && name.Length >= 1 && name.Length <= 80 && name == name.Trim() && !name.Any(char.IsControl);
     private static string NamedBaselineId(string name) => PackProtocol.Hash(Encoding.UTF8.GetBytes(name.ToUpperInvariant())).Substring(0, 32);
 
-    private PackBaseline SaveNamedBaseline(string name, string instance, IEnumerable<JObject> files) {
+    private PackBaseline SaveNamedBaseline(string name, string instance, IEnumerable<PackPublishFile> files) {
         name = name.Trim();
         if (!ValidBaselineName(name) || name == LegacyBaselineName)
             throw new InvalidDataException("请输入 1 至 80 个字符的基线名称，并避开保留名称「原有基线」。");
@@ -265,10 +385,16 @@ public sealed class PackPublisher(string root) {
         return new PackBaseline(id, name);
     }
 
-    private void StoreBaseline(string id, string name, string instance, IEnumerable<JObject> files) {
-        var snapshot = files.OrderBy(f => (string)f["path"]!, StringComparer.OrdinalIgnoreCase).ToList();
+    private void StoreBaseline(string id, string name, string instance, IEnumerable<PackPublishFile> files) {
+        var snapshot = files.OrderBy(f => f.Path, StringComparer.OrdinalIgnoreCase).ToList();
         if (snapshot.Count == 0) throw new IOException("当前扫描范围内没有可保存的旧整合包文件。");
-        var document = new JObject { ["name"] = name, ["instance"] = instance, ["files"] = new JArray(snapshot) };
+        var document = new JObject { ["name"] = name, ["instance"] = instance, ["files"] = new JArray(snapshot.Select(Snapshot)) };
+        var projects = new JObject();
+        foreach (var group in snapshot.Where(f => PackProtocol.ManagedMod(f.Path)).GroupBy(f => f.Sha256)) {
+            var keys = group.SelectMany(f => PackProtocol.ModProjects(f.Sources)).Distinct(StringComparer.Ordinal).OrderBy(s => s, StringComparer.Ordinal).ToArray();
+            if (keys.Length != 0) projects[group.Key] = new JArray(keys);
+        }
+        if (projects.HasValues) document["mod_projects"] = projects;
         ValidateBaselineDocument(document);
         WriteBaseline(id, document);
     }
@@ -292,13 +418,23 @@ public sealed class PackPublisher(string root) {
             if (!unique.Add(PackProtocol.ManagedMod(path) ? PackProtocol.EnabledModPath(path) : path))
                 throw new InvalidDataException("基线包含重复文件：" + path);
         }
+        if (document["mod_projects"] != null) {
+            var modHashes = new HashSet<string>(snapshot.Where(f => PackProtocol.ManagedMod((string)f["path"]!))
+                .Select(f => (string)f["sha256"]!), StringComparer.Ordinal);
+            if (document["mod_projects"] is not JObject projects || projects.Properties().Any(project =>
+                !modHashes.Contains(project.Name) || project.Value is not JArray { Count: > 0 } keys ||
+                keys.Any(key => key.Type != JTokenType.String || !Regex.IsMatch((string)key!, @"\A(?:modrinth|curseforge)/[a-zA-Z0-9_-]{1,128}\z"))))
+                throw new InvalidDataException("基线 Mod 平台项目格式无效。");
+        }
     }
 
     internal JObject BaselineDocument(string id) {
         var saved = Read(BaselinePath(id));
         if (saved["files"] == null) return saved;
-        return new JObject { ["name"] = id == LegacyBaselineId ? new JValue(LegacyBaselineName) : saved["name"],
+        var document = new JObject { ["name"] = id == LegacyBaselineId ? new JValue(LegacyBaselineName) : saved["name"],
             ["instance"] = saved["instance"], ["files"] = saved["files"] };
+        if (saved["mod_projects"] != null) document["mod_projects"] = saved["mod_projects"];
+        return document;
     }
 
     internal void CacheCloudBaseline(JObject document, string scope, string hash) {
@@ -393,21 +529,113 @@ public sealed class PackPublisher(string root) {
         return id == null ? new JObject() : Read(BaselinePath(id));
     }
 
-    private void AddChanges(Dictionary<string, PackPublishFile> result, string? baselineId) {
-        if (ReadBaseline(baselineId)["files"] is not JArray baseline) {
+    private void AddChanges(Dictionary<string, PackPublishFile> result, string? baselineId,
+        Action<IEnumerable<PackPublishFile>>? resolveModSources) {
+        var document = ReadBaseline(baselineId);
+        if (document["files"] is not JArray baseline) {
             if (baselineId != null) throw new IOException("找不到所选基线，请重新选择。");
             foreach (var file in result.Values) file.Change = "基线候选";
             return;
         }
-        var comparison = baselineId == null ? Latest["files"] as JArray ?? baseline : baseline;
-        var previous = comparison.Cast<JObject>()
-            .ToDictionary(f => (string)f["path"]!, StringComparer.OrdinalIgnoreCase);
-        foreach (var file in result.Values) file.Change = !previous.TryGetValue(file.Path, out var old) ? "新增" :
-            file.Sha256 == (string?)old["sha256"] ? "相同" : "更新";
+        var latest = Latest["files"] as JArray;
+        var comparison = baselineId == null ? latest ?? baseline : baseline;
+        string OldPath(JObject file) => (string)file["path"]!;
+        var previous = comparison.Cast<JObject>().ToDictionary(OldPath, StringComparer.OrdinalIgnoreCase);
+        var matched = new Dictionary<string, JObject>(StringComparer.OrdinalIgnoreCase);
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Pair(PackPublishFile file, JObject old) {
+            matched.Add(file.Path, old);
+            used.Add(OldPath(old));
+        }
+
+        var mods = result.Values.Where(f => PackProtocol.ManagedMod(f.Path)).ToArray();
+        var oldMods = previous.Values.Where(f => PackProtocol.ManagedMod(OldPath(f))).ToArray();
+        var oldById = oldMods.ToLookup(PackProtocol.ModIdentity, StringComparer.Ordinal);
+        foreach (var group in mods.Where(f => f.ModId != null).GroupBy(f => (f.FabricMod ? "fabric/" : "forge/") + f.ModId)) {
+            if (group.Count() == 1 && oldById[group.Key].Count() == 1) Pair(group.Single(), oldById[group.Key].Single());
+        }
+
+        // The prior bytes may live in a different instance. Reuse projects recorded for their exact hash.
+        var knownProjects = (latest ?? new JArray()).Concat(comparison)
+            .Select(f => (Hash: (string)f["sha256"]!, Projects: PackProtocol.ModProjects(f["sources"])))
+            .Concat(mods.Select(f => (Hash: f.Sha256, Projects: PackProtocol.ModProjects(f.Sources))))
+            .ToLookup(f => f.Hash, f => f.Projects, StringComparer.Ordinal);
+        var baselineProjects = document["mod_projects"] as JObject;
+        var availableOld = oldMods.Where(f => !used.Contains(OldPath(f))).ToArray();
+        var unmatchedMods = mods.Where(f => !matched.ContainsKey(f.Path)).ToArray();
+        var resolvedOld = new Dictionary<string, string[]>(StringComparer.Ordinal);
+        if (baselineId != null && resolveModSources != null && unmatchedMods.Any(f => f.Sources.HasValues)) {
+            string? source = (string?)Read(BaselinePreviewSources)[baselineId];
+            if (source != null && Directory.Exists(source)) {
+                var unresolved = availableOld.Where(f => {
+                    string hash = (string)f["sha256"]!;
+                    return baselineProjects?[hash] == null && !knownProjects[hash].Any(projects => projects.Any());
+                });
+                resolvedOld = ResolveOldProjects(source, unresolved, resolveModSources);
+            }
+        }
+        var oldProjects = availableOld.SelectMany(f => {
+            string hash = (string)f["sha256"]!;
+            var projects = (baselineProjects?[hash]?.Values<string>() ?? Enumerable.Empty<string>())
+                .Concat(knownProjects[hash].SelectMany(p => p))
+                .Concat(resolvedOld.TryGetValue(hash, out var keys) ? keys : Array.Empty<string>()).Distinct(StringComparer.Ordinal);
+            return projects.Select(project => (Project: project, File: f));
+        }).ToLookup(match => match.Project, match => match.File, StringComparer.Ordinal);
+
+        var projectPairs = unmatchedMods
+            .SelectMany(f => PackProtocol.ModProjects(f.Sources).SelectMany(project => oldProjects[project])
+                .Distinct().Select(old => (File: f, Old: old))).ToArray();
+        var projectTargets = projectPairs.ToLookup(pair => pair.File.Path, StringComparer.OrdinalIgnoreCase);
+        var projectOwners = projectPairs.ToLookup(pair => OldPath(pair.Old), StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in projectPairs) {
+            if (projectTargets[pair.File.Path].Count() == 1 && projectOwners[OldPath(pair.Old)].Count() == 1)
+                Pair(pair.File, pair.Old);
+        }
+
+        foreach (var file in result.Values.Where(f => !matched.ContainsKey(f.Path))) {
+            if (previous.TryGetValue(file.Path, out var old) && !used.Contains(OldPath(old))) Pair(file, old);
+        }
+        var oldByFileName = oldMods.Where(f => !used.Contains(OldPath(f)))
+            .ToLookup(f => PackProtocol.EnabledModPath(OldPath(f)), StringComparer.OrdinalIgnoreCase);
+        foreach (var group in mods.Where(f => !matched.ContainsKey(f.Path))
+                     .GroupBy(f => PackProtocol.EnabledModPath(f.Path), StringComparer.OrdinalIgnoreCase)) {
+            if (group.Count() == 1 && oldByFileName[group.Key].Count() == 1) Pair(group.Single(), oldByFileName[group.Key].Single());
+        }
+
+        foreach (var file in result.Values) {
+            if (!matched.TryGetValue(file.Path, out var old)) {
+                file.Change = "新增";
+                continue;
+            }
+            bool samePath = file.Path.Equals(OldPath(old), StringComparison.OrdinalIgnoreCase);
+            file.Change = samePath && file.Sha256 == (string?)old["sha256"] ? "相同" : "更新";
+            if (!samePath) file.PreviousPath = OldPath(old);
+        }
         foreach (var pair in previous) {
-            if (result.ContainsKey(pair.Key) || IsMapPath(pair.Key)) continue;
+            if (used.Contains(pair.Key) || result.ContainsKey(pair.Key) || IsMapPath(pair.Key)) continue;
             result.Add(pair.Key, new PackPublishFile { Path = pair.Key, Sha256 = (string)pair.Value["sha256"]!, Change = "已移出" });
         }
+    }
+
+    private static Dictionary<string, string[]> ResolveOldProjects(string source, IEnumerable<JObject> records,
+        Action<IEnumerable<PackPublishFile>> resolveModSources) {
+        var files = new Dictionary<string, PackPublishFile>(StringComparer.Ordinal);
+        foreach (var record in records) {
+            string path = (string)record["path"]!;
+            string hash = (string)record["sha256"]!;
+            if (files.ContainsKey(hash)) continue;
+            string enabled = PackProtocol.EnabledModPath(path);
+            foreach (string candidate in new[] { path, path == enabled ? enabled + ".disabled" : enabled }) {
+                string full = PackProtocol.Safe(source, candidate);
+                var info = new FileInfo(full);
+                if (!info.Exists || PackProtocol.HashFile(full) != hash) continue;
+                files.Add(hash, new PackPublishFile { Path = candidate, LocalPath = full, Sha256 = hash, Size = info.Length, Category = "mod" });
+                break;
+            }
+        }
+        if (files.Count != 0) resolveModSources(files.Values);
+        return files.Values.Where(file => file.Sources.HasValues && PackArchive.Matches(file.LocalPath, file.Size, file.Sha256))
+            .ToDictionary(file => file.Sha256, file => PackProtocol.ModProjects(file.Sources).ToArray(), StringComparer.Ordinal);
     }
 
     private static JObject Snapshot(PackPublishFile file) {

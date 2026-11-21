@@ -12,6 +12,9 @@ Public Class PageInstancePackPublish
     Private Busy As Boolean
     Private DraftFiles As List(Of PackPublishFile)
     Private PublishedAddress As String
+    Private R2CredentialTarget As String
+    Private MirrorCredentialTarget As String
+    Private LoadingCredentials As Boolean
 
     Public ReadOnly Property InstancePath As String
         Get
@@ -29,6 +32,7 @@ Public Class PageInstancePackPublish
         AddHandler PublishBaseline.Click, Async Sub() Await RecordBaseline()
         AddHandler PublishBaselineZip.Click, Async Sub() Await ImportBaseline(True)
         AddHandler PublishBaselineFolder.Click, Async Sub() Await ImportBaseline(False)
+        AddHandler PublishBaselinePreviewSource.Click, Async Sub() Await SelectBaselinePreviewSource()
         AddHandler PublishBaselineSync.Click, Async Sub() Await UpdateCloudBaselines(False)
         AddHandler PublishBaselineUpload.Click, Async Sub() Await UpdateCloudBaselines(True)
         AddHandler PublishMaps.Click, Async Sub() Await ImportPublisherMap()
@@ -52,17 +56,11 @@ Public Class PageInstancePackPublish
             LoadBaselines(CStr(Saved("baseline_id")))
             Dim SavedRoot = CStr(Saved("root"))
             PublishRoot.Text = If(String.IsNullOrWhiteSpace(SavedRoot), ModPackUpdate.DefaultPackSource, SavedRoot)
-            Dim Credentials = Publisher.ReadCredentials()
-            PublishAccess.Text = CStr(Credentials("access"))
-            PublishSecret.Password = If(CStr(Credentials("secret")), "")
             PublishMirror.Checked = If(CType(Saved("sync_mirror"), Boolean?), True)
             PublishMirrorCredentials.IsEnabled = PublishMirror.Checked
             PublishMirrorBucket.Text = If(CStr(Saved("mirror_bucket")), PackS3MirrorSettings.DefaultBucket)
             PublishMirrorRoot.Text = If(CStr(Saved("mirror_root")), PackS3MirrorSettings.DefaultSourceAddress)
-            Dim MirrorCredentials = Publisher.ReadCredentials(mirror:=True)
-            PublishMirrorAccess.Text = CStr(MirrorCredentials("access"))
-            PublishMirrorSecret.Password = If(CStr(MirrorCredentials("secret")), "")
-            PublishRemember.Checked = If(CType(Saved("remember_credentials"), Boolean?), Credentials.HasValues OrElse MirrorCredentials.HasValues)
+            PublishRemember.Checked = If(CType(Saved("remember_credentials"), Boolean?), False)
             Dim Latest = Publisher.Latest
             PublishedAddress = PackPublisher.PublishedSource(Latest)
             If Not String.IsNullOrEmpty(PublishedAddress) Then
@@ -70,6 +68,8 @@ Public Class PageInstancePackPublish
             Else
                 PublishStatus.Text = If(PublishBaselineChoice.SelectedItem IsNot Nothing, "请选择发布基线，再扫描此实例。", "请导入旧整合包，或扫描当前实例后保存为基线。")
             End If
+            LoadTargetCredentials(False, migrate:=True)
+            LoadTargetCredentials(True, migrate:=True)
         Catch ex As Exception
             PublishStatus.Text = "加载发布项目失败：" & ex.Message
         End Try
@@ -79,16 +79,23 @@ Public Class PageInstancePackPublish
                                            RefreshBaselineChoices()
                                        End Sub
         AddHandler PublishAccount.TextChanged, Sub()
+                                                   LoadTargetCredentials(False)
                                                    SaveStorageSettings()
                                                    RefreshBaselineChoices()
                                                End Sub
-        AddHandler PublishBucket.TextChanged, Sub() SaveStorageSettings()
+        AddHandler PublishBucket.TextChanged, Sub()
+                                                  LoadTargetCredentials(False)
+                                                  SaveStorageSettings()
+                                              End Sub
         AddHandler PublishBaselineBucket.TextChanged, Sub()
                                                           SaveStorageSettings()
                                                           RefreshBaselineChoices()
                                                       End Sub
         AddHandler PublishRoot.TextChanged, Sub() SaveStorageSettings()
-        AddHandler PublishMirrorBucket.TextChanged, Sub() SaveStorageSettings()
+        AddHandler PublishMirrorBucket.TextChanged, Sub()
+                                                        LoadTargetCredentials(True)
+                                                        SaveStorageSettings()
+                                                    End Sub
         AddHandler PublishMirrorRoot.TextChanged, Sub() SaveStorageSettings()
         AddHandler PublishMirror.Change, Sub()
                                              PublishMirrorCredentials.IsEnabled = PublishMirror.Checked
@@ -123,7 +130,44 @@ Public Class PageInstancePackPublish
         Saved("mirror_root") = PublishMirrorRoot.Text.Trim()
     End Sub
 
+    Private Sub LoadTargetCredentials(Mirror As Boolean, Optional Migrate As Boolean = False)
+        Dim Bucket = If(Mirror, PublishMirrorBucket.Text, PublishBucket.Text).Trim()
+        Dim CredentialTarget = PackPublisher.CredentialTarget(PublishAccount.Text.Trim(), Bucket, Mirror)
+        Dim PreviousTarget = If(Mirror, MirrorCredentialTarget, R2CredentialTarget)
+        If Not Migrate AndAlso String.Equals(CredentialTarget, PreviousTarget, StringComparison.Ordinal) Then Return
+        If Mirror Then
+            MirrorCredentialTarget = CredentialTarget
+        Else
+            R2CredentialTarget = CredentialTarget
+        End If
+
+        If Migrate Then
+            Try
+                Publisher.MigrateLegacyCredentials(CredentialTarget, Mirror)
+            Catch ex As Exception
+                PublishStatus.Text = "无法迁移旧发布凭据：" & ex.Message
+            End Try
+        End If
+
+        LoadingCredentials = True
+        Try
+            Dim AccessBox = If(Mirror, PublishMirrorAccess, PublishAccess)
+            Dim SecretBox = If(Mirror, PublishMirrorSecret, PublishSecret)
+            AccessBox.Text = ""
+            SecretBox.Password = ""
+            Dim Credentials = Publisher.ReadCredentials(CredentialTarget)
+            AccessBox.Text = If(CStr(Credentials("access")), "")
+            SecretBox.Password = If(CStr(Credentials("secret")), "")
+            If Credentials.HasValues Then PublishRemember.Checked = True
+        Catch ex As Exception
+            PublishStatus.Text = "无法读取发布凭据：" & ex.Message
+        Finally
+            LoadingCredentials = False
+        End Try
+    End Sub
+
     Private Sub SaveRememberChoice()
+        If LoadingCredentials Then Return
         Try
             SaveCurrentCredentials(False)
             SaveCurrentCredentials(True)
@@ -136,21 +180,24 @@ Public Class PageInstancePackPublish
     End Sub
 
     Private Sub SaveEditedCredentials(Mirror As Boolean)
-        If Not PublishRemember.Checked Then Return
+        If LoadingCredentials OrElse Not PublishRemember.Checked Then Return
         Try
-            SaveCurrentCredentials(Mirror)
+            SaveCurrentCredentials(Mirror, saveEmpty:=True)
         Catch ex As Exception
             PublishStatus.Text = "无法保存发布凭据：" & ex.Message
         End Try
     End Sub
 
-    Private Sub SaveCurrentCredentials(Mirror As Boolean)
+    Private Sub SaveCurrentCredentials(Mirror As Boolean, Optional SaveEmpty As Boolean = False)
+        Dim CredentialTarget = If(Mirror, MirrorCredentialTarget, R2CredentialTarget)
         If Not PublishRemember.Checked Then
-            Publisher.SaveCredentials("", "", Mirror)
-        ElseIf Mirror Then
-            Publisher.SaveCredentials(PublishMirrorAccess.Text.Trim(), PublishMirrorSecret.Password, mirror:=True)
+            Publisher.SaveCredentials(CredentialTarget, "", "")
         Else
-            Publisher.SaveCredentials(PublishAccess.Text.Trim(), PublishSecret.Password)
+            Dim Access = If(Mirror, PublishMirrorAccess.Text, PublishAccess.Text).Trim()
+            Dim Secret = If(Mirror, PublishMirrorSecret.Password, PublishSecret.Password)
+            If SaveEmpty OrElse Access.Length > 0 OrElse Secret.Length > 0 Then
+                Publisher.SaveCredentials(CredentialTarget, Access, Secret)
+            End If
         End If
     End Sub
 
@@ -162,6 +209,7 @@ Public Class PageInstancePackPublish
     Private Sub UpdatePublisherControls()
         PublishCard.IsEnabled = Not Busy
         PublishBaseline.IsEnabled = Not Busy AndAlso DraftFiles IsNot Nothing
+        PublishBaselinePreviewSource.IsEnabled = Not Busy AndAlso PublishBaselineChoice.SelectedItem IsNot Nothing
         PublishBaselineSync.IsEnabled = Not Busy AndAlso PublishBaselineSyncAvailable()
         PublishBaselineUpload.IsEnabled = PublishBaselineSync.IsEnabled AndAlso PublishBaselineChoice.SelectedItem IsNot Nothing
         PublishNow.IsEnabled = Not Busy AndAlso PublishBaselineChoice.SelectedItem IsNot Nothing AndAlso DraftFiles IsNot Nothing
@@ -240,9 +288,8 @@ Public Class PageInstancePackPublish
             DraftFiles = Await Task.Run(
                 Function()
                     ModPackUpdate.CheckIdle(Target)
-                    Dim Files = Publisher.Scan(Folders, compare:=Choice IsNot Nothing, files:=Selected, baselineId:=Choice?.Id)
-                    If Choice IsNot Nothing Then ResolveModSources(Files)
-                    Return Files
+                    Return Publisher.Scan(Folders, compare:=Choice IsNot Nothing, files:=Selected, baselineId:=Choice?.Id,
+                                          resolveModSources:=AddressOf ResolveModSources)
                 End Function)
             PublishFiles.ItemsSource = DraftFiles
             PublishStatus.Text = If(Choice IsNot Nothing,
@@ -258,6 +305,20 @@ Public Class PageInstancePackPublish
         Finally
             SetBusy(False)
         End Try
+    End Function
+
+    Private Async Function SelectBaselinePreviewSource() As Task
+        Dim Baseline = TryCast(PublishBaselineChoice.SelectedItem, PackBaseline)
+        If Busy OrElse Baseline Is Nothing Then Return
+        Dim Source = Dialogs.SelectFolder("选择当前基线对应的旧实例目录（包含 mods 文件夹）", False).FirstOrDefault()
+        If String.IsNullOrEmpty(Source) Then Return
+        Try
+            Publisher.SetBaselinePreviewSource(Baseline.Id, Source)
+        Catch ex As Exception
+            PublishStatus.Text = "无法保存基线文件目录：" & ex.Message
+            Return
+        End Try
+        Await ScanPublisher()
     End Function
 
     Private Async Function RecordBaseline() As Task
@@ -279,8 +340,8 @@ Public Class PageInstancePackPublish
         If String.IsNullOrWhiteSpace(Name) Then Return
         Dim Folders = SelectedFolders()
         Dim Files = SelectedFilePaths()
-        Await SaveBaseline(Function() If(FromZip, Publisher.ImportBaselineZip(Name, Source, Folders, Files),
-                                               Publisher.ImportBaselineFolder(Name, Source, Folders, Files)))
+        Await SaveBaseline(Function() If(FromZip, Publisher.ImportBaselineZip(Name, Source, Folders, Files, AddressOf ResolveModSources),
+                                               Publisher.ImportBaselineFolder(Name, Source, Folders, Files, AddressOf ResolveModSources)))
     End Function
 
     Private Async Function SaveBaseline(Save As Func(Of PackBaseline)) As Task

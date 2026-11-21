@@ -27,6 +27,8 @@
                         <local:MyButton x:Name="PublishBaseline" Text="保存预览为基线" Height="34" MinWidth="120" Margin="0,0,8,4" />
                         <local:MyButton x:Name="PublishBaselineZip" Text="导入旧包 ZIP" Height="34" MinWidth="110" Margin="0,0,8,4" />
                         <local:MyButton x:Name="PublishBaselineFolder" Text="导入旧实例目录" Height="34" MinWidth="120" Margin="0,0,8,4" />
+                        <local:MyButton x:Name="PublishBaselinePreviewSource" Text="补查旧版平台" Height="34" MinWidth="110" Margin="0,0,8,4"
+                                        ToolTip="选择当前基线对应的旧实例目录，联网匹配基线里的旧 Mod。" />
                         <local:MyButton x:Name="PublishMaps" Text="导入 Xaero 地图" Height="34" MinWidth="125" Margin="0,0,8,4" />
                         <local:MyButton x:Name="PublishWaypoints" Text="导入 Xaero 航点" Height="34" MinWidth="125" Margin="0,0,8,4" />
                         <local:MyButton x:Name="PublishSelectZip" Text="确认全部 Mod 可公开分发" Height="34" MinWidth="185" Margin="0,0,8,4" />
@@ -34,7 +36,13 @@
                     <DataGrid x:Name="PublishFiles" AutoGenerateColumns="False" CanUserAddRows="False" MaxHeight="395" MinHeight="100"
                               EnableRowVirtualization="True" RowHeaderWidth="0" SelectionMode="Single" Margin="0,0,0,8">
                         <DataGrid.Columns>
-                            <DataGridTextColumn Header="文件" Binding="{Binding Path}" Width="2*" IsReadOnly="True" />
+                            <DataGridTextColumn Header="文件" Binding="{Binding Path}" Width="2*" IsReadOnly="True">
+                                <DataGridTextColumn.CellStyle>
+                                    <Style TargetType="DataGridCell">
+                                        <Setter Property="ToolTip" Value="{Binding PreviousPath}" />
+                                    </Style>
+                                </DataGridTextColumn.CellStyle>
+                            </DataGridTextColumn>
                             <DataGridTextColumn Header="变化" Binding="{Binding Change}" Width="62" IsReadOnly="True" />
                             <DataGridTextColumn Header="来源" Binding="{Binding Platform}" Width="82" IsReadOnly="True" />
                             <DataGridComboBoxColumn x:Name="PublishOperations" Header="发布策略" SelectedItemBinding="{Binding Operation}" Width="132" />
@@ -78,7 +86,8 @@
                         </StackPanel>
                     </UniformGrid>
                     <WrapPanel Margin="0,2,0,8">
-                        <local:MyCheckBox x:Name="PublishRemember" Text="为当前 Windows 用户保存凭据" Margin="0,0,14,6" />
+                        <local:MyCheckBox x:Name="PublishRemember" Text="为当前 Windows 用户保存凭据" Margin="0,0,14,6"
+                                          ToolTip="同一 Windows 用户的 PCL 按发布目标共用凭据。取消勾选会删除当前目标的共享凭据。" />
                         <local:MyCheckBox x:Name="PublishDowngrade" Text="允许 NeoForge 降级" Margin="0,0,0,6" />
                     </WrapPanel>
                     <WrapPanel>

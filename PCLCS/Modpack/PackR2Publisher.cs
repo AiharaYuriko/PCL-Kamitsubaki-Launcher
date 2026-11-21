@@ -24,9 +24,12 @@ public sealed class PackR2Settings {
         return address;
     }
 
+    internal static bool ValidTarget(string account, string bucket) =>
+        Regex.IsMatch(account, @"\A[a-f0-9]{32}(?:\.(?:eu|us|fedramp))?\z") &&
+        Regex.IsMatch(bucket, @"\A[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\z");
+
     internal void ValidateBucketCredentials() {
-        if (!Regex.IsMatch(Account, @"^[a-f0-9]{32}(?:\.(?:eu|us|fedramp))?$") ||
-            !Regex.IsMatch(Bucket, @"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"))
+        if (!ValidTarget(Account, Bucket))
             throw new InvalidDataException("请检查 R2 Account ID 和存储桶名称。");
         if (!Regex.IsMatch(AccessKey, "^[a-zA-Z0-9]+$") || string.IsNullOrWhiteSpace(SecretKey))
             throw new InvalidDataException("请填写 R2 S3 Access Key ID 和 Secret Access Key。");
@@ -44,8 +47,11 @@ public sealed class PackS3MirrorSettings {
     public string AccessKey { get; set; } = "";
     public string SecretKey { get; set; } = "";
 
+    internal static bool ValidBucket(string bucket) =>
+        Regex.IsMatch(bucket, @"\A[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]\z") && !bucket.Contains("..");
+
     internal void Validate() {
-        if (!Regex.IsMatch(Bucket, @"\A[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]\z") || Bucket.Contains(".."))
+        if (!ValidBucket(Bucket))
             throw new InvalidDataException("请填写有效的备用 S3 存储桶名称。");
         PackProtocol.Https(SourceAddress);
         if (new Uri(SourceAddress).Query.Length != 0)
