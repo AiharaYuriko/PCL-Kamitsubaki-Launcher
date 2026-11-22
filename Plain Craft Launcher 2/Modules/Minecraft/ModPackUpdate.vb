@@ -11,8 +11,14 @@ Public Module ModPackUpdate
         Dim Instance = Await Selection
         If Instance Is Nothing Then Return
         Dim Release As JObject
+        Dim FirstConnection As Boolean = False
         Try
-            Release = Await Task.Run(Function() New PackUpdater(Instance.PathVersion).CheckForUpdate())
+            Dim Updater As New PackUpdater(Instance.PathVersion)
+            Release = Await Task.Run(Function() Updater.CheckForUpdate())
+            If Release Is Nothing AndAlso PathUtils.IsSame(Instance.PathIndie, Instance.PathVersion) Then
+                Release = Await Task.Run(Function() Updater.CheckLegacyStartupUpdate(Paths.Base))
+                FirstConnection = Release IsNot Nothing
+            End If
         Catch ex As Exception
             Logger.Warn(ex, $"检查整合包更新失败：{Instance.Name}")
             Hint($"{Instance.Name} 的整合包更新检查失败，请在整合包更新页重试。", HintType.Red)
@@ -24,15 +30,22 @@ Public Module ModPackUpdate
         Dim ReleaseId = CStr(ReleaseInfo("id"))
         Dim ReleaseKey As String = New JArray(Release("pack")("id"), ReleaseInfo("channel"), ReleaseInfo("id"),
                                               ReleaseInfo("sequence")).ToString(Newtonsoft.Json.Formatting.None)
-        Dim Message = $"{Instance.Name} 有整合包更新（{ReleaseId}）。"
+        Dim Message = If(FirstConnection, $"{Instance.Name} 可接入 PCL 整合包更新，当前发布为 {ReleaseId}。",
+                         $"{Instance.Name} 有整合包更新（{ReleaseId}）。")
         If Settings.Get(Of String)("VersionPackUpdateDismissedRelease", Instance:=Instance) = ReleaseKey Then
             Hint(Message)
             Return
         End If
         Dim Quiet As Boolean
-        Dim Choice = MyMsgBox(Message & vbCrLf & "一键更新将沿用此实例已保存的组件选择。", "整合包更新",
+        Dim Choice As Integer
+        If FirstConnection Then
+            Choice = MyMsgBox(Message & vbCrLf & "请先查看变更预览并确认组件选择。", "整合包更新",
+                              "查看更新详情", "稍后", CheckBoxText:="此更新版本不再弹窗", CheckBoxChecked:=Quiet)
+        Else
+            Choice = MyMsgBox(Message & vbCrLf & "一键更新将沿用此实例已保存的组件选择。", "整合包更新",
                               "查看更新详情", "一键更新", "稍后", CheckBoxText:="此更新版本不再弹窗", CheckBoxChecked:=Quiet,
                               HighlightButton:=2)
+        End If
         If Quiet Then Settings.Set("VersionPackUpdateDismissedRelease", ReleaseKey, Instance:=Instance)
         Select Case Choice
             Case 1
@@ -48,7 +61,11 @@ Public Module ModPackUpdate
                 PageInstanceLeft.Instance = Instance
                 FrmMain.PageChange(FormMain.PageType.InstanceSetup, FormMain.PageSubType.InstancePackUpdate)
             Case 2
-                StartQuickUpdate(Instance, Release)
+                If Not FirstConnection Then
+                    StartQuickUpdate(Instance, Release)
+                ElseIf Quiet Then
+                    Hint(Message)
+                End If
             Case 3
                 If Quiet Then Hint(Message)
         End Select

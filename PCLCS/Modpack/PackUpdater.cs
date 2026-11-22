@@ -1,4 +1,5 @@
 using System.IO;
+using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -131,6 +132,46 @@ public sealed partial class PackUpdater {
         var release = GetRelease(pack, channel, mirror, shortTimeout: true);
         if (NeedsRecovery || !JToken.DeepEquals(state, State) || !JToken.DeepEquals(binding, Binding)) return null;
         return release;
+    }
+
+    public JObject? CheckLegacyStartupUpdate(string bundleRoot) {
+        if (State.HasValues || NeedsRecovery || !IsBundledLegacyInstance(bundleRoot)) return null;
+
+        const string packId = "kvc";
+        const string channelId = "stable";
+        var binding = Binding;
+        string source = PackMirror.DefaultPrimaryAddress;
+        PackMirror? mirror = new PackMirror(PackMirror.DefaultAddress, preferMirror: true);
+        if (binding.HasValues) {
+            source = (string?)binding["source"] ?? "";
+            if (PackMirror.DefaultAddressFor(source).Length == 0 ||
+                (string?)binding["pack_id"] != packId || (string?)binding["channel"] != channelId) return null;
+            mirror = GetBoundMirror(binding);
+        }
+
+        var index = GetIndex((string?)binding["index_url"] ?? PackProtocol.IndexAddress(source), mirror, shortTimeout: true);
+        var pack = index["packs"]!.OfType<JObject>().FirstOrDefault(item => (string?)item["id"] == packId);
+        var channel = pack?["channels"]!.OfType<JObject>().FirstOrDefault(item => (string?)item["id"] == channelId);
+        if (pack == null || channel == null) throw new IOException("更新源没有神椿市搬砖中的稳定频道。");
+
+        var release = GetRelease(pack, channel, mirror, shortTimeout: true);
+        return State.HasValues || NeedsRecovery || !JToken.DeepEquals(binding, Binding) ? null : release;
+    }
+
+    internal bool IsBundledLegacyInstance(string bundleRoot) {
+        var versions = Path.Combine(bundleRoot, ".minecraft", "versions");
+        var primary = Path.Combine(versions, "神椿市搬砖中");
+        var legacy = Path.Combine(versions, "1.21.1-NeoForge_21.1.219");
+        if (!Directory.Exists(Path.Combine(root, "mods"))) return false;
+
+        var expected = Directory.Exists(Path.Combine(primary, "mods")) ? primary : legacy;
+        if (!string.Equals(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                           Path.GetFullPath(expected), StringComparison.OrdinalIgnoreCase)) return false;
+
+        const string legacyManifest = "https://r2.iris-mapper.top/minecraft/releases/current/release-manifest.json";
+        var config = Path.Combine(bundleRoot, "client-config.toml");
+        return File.Exists(config) && File.ReadLines(config).Any(line => Regex.IsMatch(line,
+            @"^[ \t]*manifest_url[ \t]*=[ \t]*(['""])" + Regex.Escape(legacyManifest) + @"\1[ \t]*(?:#.*)?$"));
     }
     public static PackMirror? GetBoundMirror(JObject binding) {
         var address = (string?)binding["mirror_url"] ?? PackMirror.DefaultAddressFor((string?)binding["source"] ?? "");

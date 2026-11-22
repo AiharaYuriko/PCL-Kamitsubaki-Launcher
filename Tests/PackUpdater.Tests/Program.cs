@@ -97,6 +97,25 @@ internal static partial class Program {
                 throw new Exception("The startup check accepted a source bound to another channel");
             } catch (IOException ex) when (ex.Message == "此实例缺少匹配的整合包更新源。") { }
         });
+        Test("first connection recognizes only the bundled legacy instance", root => {
+            const string primary = ".minecraft/versions/神椿市搬砖中";
+            const string legacy = ".minecraft/versions/1.21.1-NeoForge_21.1.219";
+            const string config = "client-config.toml";
+            var updater = new PackUpdater(Path.Combine(root, legacy));
+            Directory.CreateDirectory(Path.Combine(root, legacy, "mods"));
+            Assert(!updater.IsBundledLegacyInstance(root), "An ordinary NeoForge instance must not be offered migration");
+            Write(root, config, "# manifest_url = 'https://r2.iris-mapper.top/minecraft/releases/current/release-manifest.json'\n" +
+                "[client]\nmanifest_url = 'https://other.example/release-manifest.json'\n");
+            Assert(!updater.IsBundledLegacyInstance(root), "A commented-out official URL must not override a custom source");
+            Write(root, config, "[client]\nmanifest_url = \"https://r2.iris-mapper.top/minecraft/releases/current/release-manifest.json\" # old updater\n");
+            Assert(updater.IsBundledLegacyInstance(root), "The older instance name must work before the old updater has run");
+            Directory.CreateDirectory(Path.Combine(root, primary, "mods"));
+            var canonical = new PackUpdater(Path.Combine(root, primary));
+            Assert(!updater.IsBundledLegacyInstance(root) && canonical.IsBundledLegacyInstance(root),
+                "Only the preferred legacy instance should get the first-connection offer");
+            canonical.Bind("https://pack.example", "test", "stable");
+            Assert(canonical.CheckLegacyStartupUpdate(root) == null, "An existing custom binding must take precedence");
+        });
         Test("publisher credentials share across instances and migrate by storage target", root => {
             string store = Path.Combine(root, "shared");
             var publisher = new PackPublisher(Path.Combine(root, "first"), store);
