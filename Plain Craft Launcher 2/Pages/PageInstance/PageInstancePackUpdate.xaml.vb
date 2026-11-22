@@ -10,6 +10,7 @@ Public Class PageInstancePackUpdate
     Private Release As JObject
     Private Preview As PackPlan
     Private Mirror As PackMirror
+    Private DownloadControl As PackDownloadControl
     Private Busy As Boolean
     Private LoadingComponents As Boolean
     Private Started As Boolean
@@ -42,6 +43,17 @@ Public Class PageInstancePackUpdate
         AddHandler Check.Click, Async Sub() Await LoadSource()
         AddHandler Update.Click, Sub() StartUpdate(False)
         AddHandler Restore.Click, Sub() StartUpdate(True)
+        AddHandler SwitchRoute.Click, Sub()
+                                          If DownloadControl Is Nothing OrElse Not DownloadControl.TrySwitch() Then Return
+                                          Logger.Info($"请求切换整合包下载线路：{Target.Name} · {Status.Text}")
+                                          Status.Text = "正在切换下载线路……"
+                                          RefreshDownloadActions()
+                                      End Sub
+        AddHandler CancelUpdate.Click, Sub()
+                                           If DownloadControl Is Nothing OrElse Not DownloadControl.TryCancel() Then Return
+                                           Status.Text = "正在取消更新，请等待当前步骤结束……"
+                                           RefreshDownloadActions()
+                                       End Sub
         AddHandler Choices.SelectionChanged, Sub()
                                                  Release = Nothing : Preview = Nothing : Components.Children.Clear() : Details.Children.Clear() : Update.IsEnabled = False
                                              End Sub
@@ -139,6 +151,7 @@ Public Class PageInstancePackUpdate
         Update.IsEnabled = Not Value AndAlso Preview IsNot Nothing AndAlso Not Preview.IsApplied
         Restore.IsEnabled = Not Value AndAlso (Updater.HasBackup OrElse Updater.NeedsRecovery)
         Bar.IsIndeterminate = Value
+        Bar.Value = 0
     End Sub
     Private Async Function LoadSource() As Task
         If Busy Then Return
@@ -303,6 +316,12 @@ Public Class PageInstancePackUpdate
             Next
         Next
     End Function
+    Private Sub RefreshDownloadActions()
+        DownloadActions.Visibility = If(DownloadControl Is Nothing, Visibility.Collapsed, Visibility.Visible)
+        SwitchRoute.IsEnabled = DownloadControl IsNot Nothing AndAlso DownloadControl.CanSwitch
+        CancelUpdate.IsEnabled = DownloadControl IsNot Nothing AndAlso DownloadControl.CanCancel
+    End Sub
+
     Private Sub StartUpdate(IsRestore As Boolean)
         If Busy OrElse (Not IsRestore AndAlso (Preview Is Nothing OrElse Preview.IsApplied)) Then Return
         If IsRestore AndAlso MyMsgBox("恢复最近一次更新前的环境和文件？", "恢复更新", "继续", "取消") <> 1 Then Return
@@ -312,17 +331,42 @@ Public Class PageInstancePackUpdate
         Dim Plan = Preview
         Dim Address = Source.Text.Trim()
         Dim DownloadMirror = Mirror
+        Dim Control = If(IsRestore, Nothing, New PackDownloadControl())
+        DownloadControl = Control
+        RefreshDownloadActions()
         SetBusy(True)
+        Status.Text = If(IsRestore, "正在恢复上次更新……", "正在准备更新……")
         If Not ModPackUpdate.StartPackTask(Target, Updater,
             Function(Progress)
                 If IsRestore Then
                     Updater.Rollback()
                     Return "已恢复，可以重新检查更新。"
                 End If
+                Control.ThrowIfCanceled()
                 Updater.Bind(Address, CStr(Plan.Release("pack")("id")), CStr(Plan.Release("release")("channel")), DownloadMirror)
-                ModPackUpdate.ApplyPackUpdate(Target, Updater, Plan, DownloadMirror, Progress)
+                ModPackUpdate.ApplyPackUpdate(Target, Updater, Plan, DownloadMirror, Progress, Control,
+                    Sub(Snapshot) RunInUi(
+                        Sub()
+                            If Control.IsCancellationRequested Then Return
+                            Status.Text = Snapshot.Text
+                            Bar.IsIndeterminate = Not Snapshot.Fraction.HasValue
+                            Bar.Value = Snapshot.Fraction.GetValueOrDefault() * Bar.Maximum
+                            RefreshDownloadActions()
+                        End Sub))
                 Return "更新完成，可以返回启动页启动游戏。仅保留最近一次回退备份。"
-            End Function, Sub(Message, Kind) Status.Text = Message, Sub(Text) Status.Text = Text,
+            End Function,
+            Sub(Message, Kind)
+                Status.Text = Message
+                DownloadControl = Nothing
+                RefreshDownloadActions()
+            End Sub,
+            Sub(Text)
+                If Control?.IsCancellationRequested = True Then Return
+                Status.Text = Text
+                Bar.IsIndeterminate = True
+                Bar.Value = 0
+                RefreshDownloadActions()
+            End Sub,
             Sub()
                 Preview = Nothing
                 SetBusy(False)

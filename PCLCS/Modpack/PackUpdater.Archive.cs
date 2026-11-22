@@ -4,6 +4,8 @@ using System.Net.Http;
 namespace PCL.Modpack;
 
 public sealed class PackDownloadOptions {
+    public PackDownloadControl? Control { get; set; }
+    public Action<PackTransferProgress>? ReportTransfer { get; set; }
     public Func<long, bool>? ApproveWholeArchive { get; set; }
     public Func<string, string, string?>? SelectLocalFile { get; set; }
     public Func<string, bool>? SkipOptional { get; set; }
@@ -361,8 +363,9 @@ public sealed partial class PackUpdater {
     }
 
     private bool StageArchiveFile(PackChange change, PackArchive archive, Dictionary<PackChange, string> staged,
-        Action<string> progress, Action<string, string, long>? download, PackDownloadOptions? options) {
+        Action<string> progress, Action<string, string, long>? download, PackDownloadOptions? options, Action<PackTransferProgress> reportTransfer) {
         var file = change.File!;
+        var control = options?.Control;
         long size = (long)file["size"]!;
         string sha = (string)file["sha256"]!;
         string cache = Work("downloads/" + sha + ".file");
@@ -376,30 +379,43 @@ public sealed partial class PackUpdater {
                 System.IO.File.Move(temporary, cache);
             }
             bool Attempt(Action action) {
+                control?.ThrowIfCanceled();
                 try { action(); Verify(); return true; }
-                catch (Exception ex) when (ex is IOException or InvalidDataException or HttpRequestException or OperationCanceledException or UnauthorizedAccessException) {
+                catch (Exception ex) when (ex is not PackUpdateCanceledException &&
+                    ex is IOException or InvalidDataException or HttpRequestException or OperationCanceledException or UnauthorizedAccessException) {
                     failure = ex;
                     return false;
                 }
             }
             bool ready = false;
-            foreach (string url in file["urls"]!.Select(item => (string)item!)) {
-                for (int attempt = 0; attempt < 2 && !ready; attempt++) {
-                    progress("正在从 " + PackChange.DownloadSourceFor(url) + " 下载：" + change.Name);
+            bool hasEntry = file["entry"] is JObject;
+            var urls = file["urls"]!.Values<string>().ToArray();
+            for (int round = 0; round < DownloadRounds && !ready; round++) {
+                string title = round == 0 ? change.Name : $"{change.Name}（第 {round + 1} 轮）";
+                for (int route = 0; route < urls.Length; route++) {
+                    string url = urls[route]!;
+                    bool canSwitch = hasEntry || route + 1 < urls.Length || (urls.Length > 1 && round + 1 < DownloadRounds);
+                    string label = "正在从 " + PackChange.DownloadSourceFor(url) + " 下载：" + title;
+                    progress(label);
                     ready = Attempt(() => {
                         if (download != null) download(url, temporary, size);
                         else {
                             using var output = System.IO.File.Create(temporary);
-                            PackProtocol.Download(url, output, size, null);
+                            PackProtocol.Download(url, output, size, label, reportTransfer, control: control, canSwitch: canSwitch);
                         }
                     });
+                    if (ready) break;
                 }
-                if (ready) break;
+                if (!ready && hasEntry) {
+                    progress("正在读取" + PackChange.ArchiveDownloadSource + "：" + title);
+                    bool moreRoutes = round + 1 < DownloadRounds && (urls.Length > 0 || options?.Mirror != null);
+                    ready = Attempt(() => archive.ExtractRange(file, temporary, Work("stage/compressed.part"), title, moreRoutes));
+                }
             }
-            if (!ready && file["entry"] != null) {
-                progress("正在读取" + PackChange.ArchiveDownloadSource + "：" + change.Name);
-                ready = Attempt(() => archive.Extract(file, temporary, Work("stage/compressed.part")));
+            if (!ready && hasEntry && failure != null) {
+                ready = Attempt(() => archive.FetchWhole(file, temporary, failure));
             }
+            control?.ThrowIfCanceled();
             if (!ready && options?.SelectLocalFile?.Invoke(change.Path, failure?.Message ?? "") is string source && source.Length > 0) {
                 ready = Attempt(() => {
                     using var input = System.IO.File.OpenRead(source);
@@ -408,6 +424,7 @@ public sealed partial class PackUpdater {
                 });
             }
             if (!ready) {
+                control?.ThrowIfCanceled();
                 if ((bool?)file["optional"] == true && options?.SkipOptional?.Invoke(change.Path) == true) return false;
                 throw new IOException("无法取得文件 " + change.Path + "：" + (failure?.Message ?? "没有可用下载源。"), failure);
             }

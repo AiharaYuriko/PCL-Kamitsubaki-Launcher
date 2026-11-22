@@ -6,6 +6,78 @@ using PCL.Modpack;
 
 internal static partial class Program {
     private static void TestArchiveLinks() {
+        Test("download timeout fires when a response stops sending data", _ => {
+            using var stream = new StalledDownload();
+            using var handler = new ArchiveRequests(_ => new HttpResponseMessage(HttpStatusCode.OK) {
+                Content = new StreamContent(stream)
+            });
+            using var output = new MemoryStream();
+            var snapshots = new List<PackTransferProgress>();
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            try {
+                PackProtocol.Transfer("https://cdn.modrinth.com/test.jar", output, 2, null, null, 0, true, messageHandler: handler,
+                    label: "Modrinth test.jar", report: snapshots.Add);
+                throw new Exception("Stalled download completed without a timeout");
+            } catch (IOException ex) {
+                Assert(ex.Message == "下载线路长时间未返回数据。" && output.Length == 1 &&
+                    elapsed.Elapsed >= TimeSpan.FromSeconds(14) && elapsed.Elapsed < TimeSpan.FromSeconds(23),
+                    "Stalled response did not time out after 15 seconds");
+            }
+            Assert(snapshots[0].Text.Contains("等待服务器响应") && snapshots[0].Fraction == null,
+                "Missing connection status before receiving headers");
+            Assert(snapshots.Any(s => s.Fraction == 0.5 && s.Text.Contains("1 B / 2 B") && s.Text.Contains("1 B/s")),
+                "Missing received size, fraction or speed");
+            Assert(snapshots.Any(s => s.Fraction == 0.5 && s.Text.Contains("0 B/s") && s.Text.Contains("未收到数据")),
+                "Progress stopped reporting while the connection was idle");
+            Assert(snapshots.Last().TimedOut && snapshots.Last().Fraction == 0.5, "Missing timeout status");
+        });
+        Test("manual switch and cancellation interrupt a stalled response", _ => {
+            foreach (bool cancel in new[] { false, true }) {
+                var control = new PackDownloadControl();
+                using var stream = new StalledDownload();
+                using var handler = new ArchiveRequests(_ => new HttpResponseMessage(HttpStatusCode.OK) {
+                    Content = new StreamContent(stream)
+                });
+                using var output = new MemoryStream();
+                var snapshots = new List<PackTransferProgress>();
+                var worker = Task.Run(() => {
+                    try {
+                        PackProtocol.Transfer("https://example.org/test.jar", output, 2, null, null, 0, true,
+                            messageHandler: handler, report: snapshots.Add, control: control, canSwitch: true);
+                        return null;
+                    } catch (Exception ex) {
+                        return ex;
+                    }
+                });
+                Assert(stream.WaitForStall() && control.CanSwitch, "The download did not reach the stalled read");
+                Assert(cancel ? control.TryCancel() : control.TrySwitch(), "The interruption request was rejected");
+                Assert(worker.Wait(TimeSpan.FromSeconds(5)), "The request did not interrupt the read");
+                Assert(cancel ? worker.Result is PackUpdateCanceledException : worker.Result is IOException,
+                    "The interruption did not return the expected outcome");
+                Assert(!snapshots.Any(snapshot => snapshot.TimedOut) && !control.CanSwitch, "Manual interruption was reported as a timeout");
+                if (cancel) continue;
+                using var next = new ArchiveRequests(_ => new HttpResponseMessage(HttpStatusCode.OK) {
+                    Content = new ByteArrayContent(new byte[] { 3, 4 })
+                });
+                output.SetLength(0);
+                PackProtocol.Transfer("https://mirror.example/test.jar", output, 2, null, null, 0, true, messageHandler: next, control: control);
+                Assert(output.ToArray().SequenceEqual(new byte[] { 3, 4 }), "The switched request interrupted the next route");
+            }
+        });
+        Test("ongoing low throughput reports an estimated remaining time", _ => {
+            var snapshots = new List<PackTransferProgress>();
+            using (var reporter = new PackTransferReporter("slow download", 512 * 1024, TimeSpan.FromSeconds(15), snapshots.Add)) {
+                reporter.BeginBody();
+                var elapsed = System.Diagnostics.Stopwatch.StartNew();
+                long received = 0;
+                while (elapsed.Elapsed < TimeSpan.FromSeconds(7)) {
+                    reporter.Receive(received += 4096);
+                    Thread.Sleep(300);
+                }
+            }
+            Assert(snapshots.Any(snapshot => snapshot.Text.Contains("仍在下载，预计剩余")), "Slow data was not accompanied by an estimate");
+            Assert(!snapshots.Any(snapshot => snapshot.TimedOut), "Low throughput should keep the transfer running");
+        });
         Test("ZIP ranges reuse the presigned URL and refresh once on S3 rejection", _ => {
             const string signer = "https://sign.example/pcl/archives/test.zip";
             var requests = new List<string>();
@@ -61,5 +133,25 @@ internal static partial class Program {
     private sealed class ArchiveRequests(Func<HttpRequestMessage, HttpResponseMessage> send) : HttpMessageHandler {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
             Task.FromResult(send(request));
+    }
+
+    private sealed class StalledDownload() : MemoryStream(new byte[] { 1 }) {
+        private readonly TaskCompletionSource<bool> disposed = new();
+        private readonly TaskCompletionSource<bool> stalled = new();
+
+        internal bool WaitForStall() => stalled.Task.Wait(TimeSpan.FromSeconds(5));
+
+        public override int Read(byte[] buffer, int offset, int count) {
+            int received = base.Read(buffer, offset, count);
+            if (received > 0) return received;
+            stalled.TrySetResult(true);
+            if (!disposed.Task.Wait(TimeSpan.FromSeconds(25))) throw new IOException("Test stream was never aborted");
+            throw new ObjectDisposedException(nameof(StalledDownload));
+        }
+
+        protected override void Dispose(bool disposing) {
+            if (disposing) disposed.TrySetResult(true);
+            base.Dispose(disposing);
+        }
     }
 }

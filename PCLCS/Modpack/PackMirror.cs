@@ -45,6 +45,7 @@ public sealed class PackMirror {
         }
     }
 
-    private static bool CanRetry(Exception ex) =>
+    internal static bool CanRetry(Exception ex) =>
+        ex is not PackUpdateCanceledException &&
         ex is IOException or InvalidDataException or HttpRequestException or OperationCanceledException or JsonException;
 }

@@ -385,13 +385,71 @@ internal static partial class Program {
             updater.Apply(preview, () => new PackRuntime(), messages.Add,
                 (_, _, _) => { platform++; throw new IOException("platform offline"); },
                 new PackDownloadOptions { DownloadRange = LocalRanges(zip, size => { ranges++; bytes += size; }) });
-            Assert(platform == 4 && ranges == 2 && bytes < new FileInfo(zip).Length, "Fallback downloaded more than the two ZIP slices");
+            Assert(platform == 2 && ranges == 2 && bytes < new FileInfo(zip).Length, "Each ZIP fallback should run before retrying a platform URL");
             Assert(messages.Any(m => m.StartsWith("正在从 Modrinth 下载", StringComparison.Ordinal)) &&
                 messages.Any(m => m.StartsWith("正在从 CurseForge 下载", StringComparison.Ordinal)) &&
                 messages.Any(m => m.StartsWith("正在读取整合包 ZIP", StringComparison.Ordinal)), "Progress did not show the attempted sources");
             Assert(System.IO.File.ReadAllText(Path.Combine(player, "mods/new1.jar")) == "first" &&
                 System.IO.File.ReadAllText(Path.Combine(player, "mods/new2.jar")) == "second", "Archive data was not installed");
             Assert(System.IO.File.Exists(Path.Combine(player, "config/empty.toml")), "Empty ZIP member was not installed");
+        });
+        Test("mod downloads try every route before starting a second round", root => {
+            string author = Path.Combine(root, "author"), player = Path.Combine(root, "player"), zip = Path.Combine(root, "pack.zip");
+            Write(author, "config/base.toml", "base");
+            Write(player, "config/base.toml", "base");
+            var publisher = new PackPublisher(author);
+            publisher.SaveBaseline(publisher.Scan(PackPublisher.DefaultFolders));
+            Write(author, "mods/new.jar", "new");
+            var files = publisher.Scan(PackPublisher.DefaultFolders);
+            var mod = files.Single(file => file.Category == "mod");
+            mod.EmbedMod = true;
+            mod.Urls.Add("https://cdn.modrinth.com/new.jar");
+            mod.Urls.Add("https://mediafilez.forgecdn.net/new.jar");
+            var release = publisher.Build(Details(), files, 1, zip, "https://primary.example");
+            var updater = new PackUpdater(player);
+            var requests = new List<string>();
+            int ranges = 0;
+            var local = LocalRanges(zip);
+            updater.Apply(updater.Plan(release, Array.Empty<string>()), () => new PackRuntime(), _ => { },
+                (address, _, _) => {
+                    requests.Add(new Uri(address).Host);
+                    throw new IOException("Platform offline");
+                }, new PackDownloadOptions {
+                    Mirror = new PackMirror("https://mirror.example", preferMirror: true),
+                    ApproveWholeArchive = _ => throw new Exception("Second round should run before asking for a full archive"),
+                    DownloadRange = (address, output, offset, length, total) => {
+                        requests.Add(new Uri(address).Host);
+                        if (++ranges < 3) throw new IOException("ZIP route offline");
+                        local(address, output, offset, length, total);
+                    }
+                });
+            Assert(requests.SequenceEqual(new[] {
+                "cdn.modrinth.com", "mediafilez.forgecdn.net", "mirror.example", "primary.example",
+                "cdn.modrinth.com", "mediafilez.forgecdn.net", "mirror.example"
+            }), "Download routes were retried out of order");
+            Assert(System.IO.File.ReadAllText(Path.Combine(player, "mods/new.jar")) == "new", "Second round did not install the mod");
+        });
+        Test("canceling before writes preserves the instance and cancellation ends at commit", root => {
+            Write(root, "mods/original.jar", "original");
+            var updater = new PackUpdater(root);
+            var control = new PackDownloadControl();
+            var plan = updater.Plan(Release(1, FileEntry("mods/new.jar", "new")), Array.Empty<string>());
+            try {
+                updater.Apply(plan, () => {
+                    Assert(control.TryCancel(), "Cancellation should be possible while preparing the runtime");
+                    return new PackRuntime { Commit = () => throw new Exception("Canceled updates must not write files") };
+                }, _ => { }, Download, new PackDownloadOptions { Control = control });
+                throw new Exception("Canceled update completed");
+            } catch (PackUpdateCanceledException) { }
+            Assert(!updater.NeedsRecovery && !updater.State.HasValues &&
+                !File.Exists(Path.Combine(root, "mods/new.jar")) &&
+                File.ReadAllText(Path.Combine(root, "mods/original.jar")) == "original", "Cancellation modified the instance");
+
+            control = new PackDownloadControl();
+            updater.Apply(plan, () => new PackRuntime {
+                Commit = () => Assert(!control.CanCancel && !control.TryCancel(), "Cancellation should be unavailable once writes start")
+            }, _ => { }, Download, new PackDownloadOptions { Control = control });
+            Assert(File.ReadAllText(Path.Combine(root, "mods/new.jar")) == "new", "The completed update did not install the file");
         });
         Test("S3 fallback retries corrupt ZIP ranges and stays on the working route", root => {
             string author = Path.Combine(root, "author"), player = Path.Combine(root, "player"), zip = Path.Combine(root, "pack.zip");
@@ -840,9 +898,9 @@ internal static partial class Program {
             using var archive = new PackArchive((JObject)manifest["archive"]!, zip, _ => { }, _ => throw new Exception(),
                 (_, _, _, _, _) => throw new Exception("A complete verified archive should be reused"));
             string output = Path.Combine(root, "extracted");
-            archive.Extract(entry, output, Path.Combine(root, "scratch"));
+            archive.ExtractRange(entry, output, Path.Combine(root, "scratch"));
             Assert(System.IO.File.ReadAllText(output) == "first", "Complete ZIP extraction failed");
-            archive.Extract((JObject)manifest["files"]![1]!, output, Path.Combine(root, "scratch"));
+            archive.ExtractRange((JObject)manifest["files"]![1]!, output, Path.Combine(root, "scratch"));
             Assert(System.IO.File.ReadAllText(output) == "second", "Second indexed ZIP entry extraction failed");
             entry["entry"]!["offset"] = (long)manifest["archive"]!["size"]!;
             Throws(() => PackProtocol.Validate(manifest, "release"));

@@ -22,6 +22,12 @@
                     <WrapPanel x:Name="Components" />
                     <TextBlock x:Name="Status" TextWrapping="Wrap" Margin="0,4,0,15" />
                     <ProgressBar x:Name="Bar" Height="3" Margin="0,0,0,15" />
+                    <WrapPanel x:Name="DownloadActions" Visibility="Collapsed" Margin="0,0,0,10">
+                        <local:MyButton x:Name="SwitchRoute" Text="换线路" Height="32" MinWidth="95" Margin="0,0,12,0"
+                                        ToolTip="跳过当前下载，尝试下一条可用线路" />
+                        <local:MyButton x:Name="CancelUpdate" Text="取消更新" Height="32" MinWidth="95"
+                                        ToolTip="停止本次更新，已校验的整合包文件可供下次重试" />
+                    </WrapPanel>
                     <WrapPanel>
                         <local:MyButton x:Name="Update" Text="更新整合包" ColorType="Highlight" Height="35" MinWidth="140" Margin="0,0,15,0" IsEnabled="False" />
                         <local:MyButton x:Name="Check" Text="重新检查" Height="35" MinWidth="120" Margin="0,0,15,0" />

@@ -4,7 +4,8 @@ using System.IO.Compression;
 namespace PCL.Modpack;
 
 internal sealed class PackArchive(JObject archive, string cache, Action<string> progress, Func<long, bool>? approveWhole,
-    Action<string, Stream, long, long, long>? range = null, PackMirror? mirror = null) : IDisposable {
+    Action<string, Stream, long, long, long>? range = null, PackMirror? mirror = null,
+    Action<PackTransferProgress>? reportTransfer = null, PackDownloadControl? control = null) : IDisposable {
     private readonly string url = (string)archive["download_url"]!;
     private readonly long size = (long)archive["size"]!;
     private readonly string hash = (string)archive["sha256"]!;
@@ -16,7 +17,10 @@ internal sealed class PackArchive(JObject archive, string cache, Action<string> 
 
     public void Dispose() => whole?.Dispose();
 
-    internal void Extract(JObject file, string destination, string scratch) {
+    private static string SourceName(string address, bool viaMirror) =>
+        viaMirror ? "S3 备用线路" : $"主线路（{new Uri(address).Host}）";
+
+    internal void ExtractRange(JObject file, string destination, string scratch, string? name = null, bool moreRoutes = false) {
         if (file["entry"] is not JObject entry) throw new IOException("此文件没有 ZIP 备用内容。");
         if (!verifiedWhole && System.IO.File.Exists(cache)) {
             verifiedWhole = Matches(cache, size, hash);
@@ -27,13 +31,17 @@ internal sealed class PackArchive(JObject archive, string cache, Action<string> 
             return;
         }
         long length = (long)entry["length"]!;
+        int route = 0;
         bool ReadEntry(string address, bool viaMirror) {
-            if (viaMirror) progress("正在从 S3 备用线路读取：" + (string)file["path"]!);
+            bool canSwitch = (mirror != null && route++ == 0) || moreRoutes;
+            string label = $"正在从 {SourceName(address, viaMirror)} 读取 ZIP 分段：{name ?? (string)file["path"]!}";
+            progress(label);
             using var compressed = new FileStream(scratch, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
             if (length != 0) {
                 long offset = (long)entry["offset"]!;
                 if (range != null) range(address, compressed, offset, length, size);
-                else PackProtocol.DownloadRange(address, compressed, offset, length, size, mirror != null, viaMirror ? mirrorLink : null);
+                else PackProtocol.DownloadRange(address, compressed, offset, length, size, true, viaMirror ? mirrorLink : null,
+                    label, reportTransfer, control, canSwitch);
             }
             compressed.Position = 0;
             long expected = (long)file["size"]!;
@@ -50,28 +58,38 @@ internal sealed class PackArchive(JObject archive, string cache, Action<string> 
         try {
             if (mirror == null) ReadEntry(url, false);
             else mirror.Read(url, PackPublisher.ArchiveKey(hash), ReadEntry);
-        } catch (Exception ex) when (ex is IOException or InvalidDataException or System.Net.Http.HttpRequestException or OperationCanceledException) {
-            FetchWhole(file, destination, ex);
         } finally {
             if (System.IO.File.Exists(scratch)) System.IO.File.Delete(scratch);
         }
     }
 
-    private void FetchWhole(JObject file, string destination, Exception failure) {
+    internal void FetchWhole(JObject file, string destination, Exception failure) {
         allowWhole ??= approveWhole?.Invoke(size) ?? false;
         if (allowWhole != true) throw new IOException("无法使用 ZIP 分段下载：" + failure.Message, failure);
         string temporary = cache + ".part";
+        int round = 0;
+        int route = 0;
         bool DownloadWhole(string address, bool viaMirror) {
-            string label = viaMirror ? "正在从 S3 备用线路下载完整整合包" : "正在下载完整整合包";
+            bool canSwitch = mirror != null && (route++ == 0 || round + 1 < PackUpdater.DownloadRounds);
+            string label = $"正在从 {SourceName(address, viaMirror)} 下载完整 ZIP";
+            if (round > 0) label += $"（第 {round + 1} 轮）";
             progress(label + "……");
-            using (var output = System.IO.File.Create(temporary)) PackProtocol.Download(address, output, size,
-                received => progress($"{label}：{received / 1048576d:F1} / {size / 1048576d:F1} MB"), mirror != null, viaMirror ? mirrorLink : null);
+            using (var output = System.IO.File.Create(temporary))
+                PackProtocol.Download(address, output, size, label, reportTransfer, viaMirror ? mirrorLink : null, control, canSwitch);
             if (!Matches(temporary, size, hash)) throw new InvalidDataException("完整 ZIP 校验失败。");
             return true;
         }
         try {
-            if (mirror == null) DownloadWhole(url, false);
-            else mirror.Read(url, PackPublisher.ArchiveKey(hash), DownloadWhole);
+            for (; ; round++) {
+                route = 0;
+                try {
+                    if (mirror == null) DownloadWhole(url, false);
+                    else mirror.Read(url, PackPublisher.ArchiveKey(hash), DownloadWhole);
+                    break;
+                } catch (Exception ex) when (round + 1 < PackUpdater.DownloadRounds && PackMirror.CanRetry(ex)) {
+                    // Each line gets a turn before retrying a full download.
+                }
+            }
             System.IO.File.Move(temporary, cache);
             verifiedWhole = true;
         } finally {

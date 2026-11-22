@@ -73,10 +73,42 @@ Public Module ModPackUpdate
 
     Private Sub StartQuickUpdate(Instance As McInstance, OfferedRelease As JObject)
         Dim Updater As New PackUpdater(Instance.PathVersion, AddressOf PageInstancePackPublish.ResolveModSources)
+        Dim Control As New PackDownloadControl()
+        Dim ProgressHint As New MyHint With {.Theme = MyHint.Themes.Blue}
+        Dim SwitchRoute As New MyButton With {.Text = "换线路", .Height = 32, .MinWidth = 95, .Margin = New Thickness(0, 0, 8, 0), .IsEnabled = False}
+        Dim CancelUpdate As New MyButton With {.Text = "取消更新", .Height = 32, .MinWidth = 95}
+        Dim Actions As New StackPanel With {.Orientation = Orientation.Horizontal, .HorizontalAlignment = HorizontalAlignment.Right,
+                                            .Margin = New Thickness(0, 4, 0, 0)}
+        Actions.Children.Add(SwitchRoute)
+        Actions.Children.Add(CancelUpdate)
+        Dim ProgressPanel As New StackPanel With {.Margin = New Thickness(0, 6, 0, 0)}
+        ProgressPanel.Children.Add(ProgressHint)
+        ProgressPanel.Children.Add(Actions)
+        Dim ShowProgress As Action(Of String) =
+            Sub(Text)
+                If Control.IsCancellationRequested Then Return
+                ProgressHint.Text = $"{Instance.Name} · {Text}"
+                SwitchRoute.IsEnabled = Control.CanSwitch
+                CancelUpdate.IsEnabled = Control.CanCancel
+            End Sub
+        AddHandler SwitchRoute.Click, Sub()
+                                          If Not Control.TrySwitch() Then Return
+                                          Logger.Info($"请求切换整合包下载线路：{ProgressHint.Text}")
+                                          ShowProgress("正在切换下载线路……")
+                                      End Sub
+        AddHandler CancelUpdate.Click, Sub()
+                                           If Not Control.TryCancel() Then Return
+                                           ProgressHint.Text = $"{Instance.Name} · 正在取消更新，请等待当前步骤结束……"
+                                           SwitchRoute.IsEnabled = False
+                                           CancelUpdate.IsEnabled = False
+                                       End Sub
+        ShowProgress("正在检查整合包更新……")
         If StartPackTask(Instance, Updater,
             Function(Progress)
+                Control.ThrowIfCanceled()
                 Dim Binding = Updater.Binding
                 Dim Release = Updater.CheckForUpdate()
+                Control.ThrowIfCanceled()
                 If Release Is Nothing OrElse Not JToken.DeepEquals(OfferedRelease, Release) OrElse Not JToken.DeepEquals(Binding, Updater.Binding) Then
                     Throw New IOException("更新信息已变更，请到整合包更新页重新检查。")
                 End If
@@ -88,10 +120,15 @@ Public Module ModPackUpdate
                 If Plan.BaselineMatches.HasValue AndAlso Plan.BaselineMatches.Value = 0 Then
                     Throw New IOException("当前实例没有匹配旧版基线的文件，请到整合包更新页核对变更预览。")
                 End If
-                ApplyPackUpdate(Instance, Updater, Plan, PackUpdater.GetBoundMirror(Binding), Progress)
+                ApplyPackUpdate(Instance, Updater, Plan, PackUpdater.GetBoundMirror(Binding), Progress, Control,
+                                Sub(Snapshot) RunInUi(Sub() ShowProgress(Snapshot.Text)))
                 Return $"{Instance.Name} 的整合包已更新。"
-            End Function, Sub(Message, Kind) Hint(Message, Kind)) Then
-            Hint($"正在更新 {Instance.Name} 的整合包…")
+            End Function,
+            Sub(Message, Kind)
+                FrmMain.PanPackUpdateProgress.Children.Remove(ProgressPanel)
+                Hint(Message, Kind)
+            End Sub, ShowProgress) Then
+            FrmMain.PanPackUpdateProgress.Children.Add(ProgressPanel)
         End If
     End Sub
 
@@ -106,6 +143,9 @@ Public Module ModPackUpdate
                                            If ReportProgress IsNot Nothing Then RunInUi(Sub() ReportProgress(Text))
                                        End Sub)
                     RunInUi(Sub() ReportResult(Message, HintType.Green))
+                Catch ex As PackUpdateCanceledException
+                    Logger.Info($"整合包更新已取消：{Instance.Name}")
+                    RunInUi(Sub() ReportResult("已取消整合包更新，可以重新检查后再试。", HintType.Blue))
                 Catch ex As Exception
                     Logger.Warn(ex, $"整合包任务未完成：{Instance.Name}")
                     Dim Message = "任务未完成：" & ex.Message & vbCrLf &
@@ -133,9 +173,25 @@ Public Module ModPackUpdate
         Return False
     End Function
 
-    Friend Sub ApplyPackUpdate(Instance As McInstance, Updater As PackUpdater, Plan As PackPlan, Mirror As PackMirror, Progress As Action(Of String))
+    Friend Sub ApplyPackUpdate(Instance As McInstance, Updater As PackUpdater, Plan As PackPlan, Mirror As PackMirror, Progress As Action(Of String), Control As PackDownloadControl,
+                               ReportTransfer As Action(Of PackTransferProgress))
+        Dim PreviousRequestTimedOut As Boolean
         Updater.Apply(Plan, Function() PrepareRuntime(Instance, Plan.Release), Progress, options:=New PackDownloadOptions With {
             .Mirror = Mirror,
+            .Control = Control,
+            .ReportTransfer = Sub(Snapshot)
+                                  If Snapshot.TimedOut Then
+                                      PreviousRequestTimedOut = True
+                                      Logger.Warn($"整合包下载超时：{Instance.Name} · {Snapshot.Text}")
+                                  ElseIf PreviousRequestTimedOut Then
+                                      If Snapshot.Fraction.GetValueOrDefault() > 0 Then
+                                          PreviousRequestTimedOut = False
+                                      Else
+                                          Snapshot = New PackTransferProgress(Snapshot.Text & " · 上次请求超时，正在重试", Snapshot.Fraction)
+                                      End If
+                                  End If
+                                  ReportTransfer(Snapshot)
+                              End Sub,
             .ApproveWholeArchive = Function(Size) RunInUiWait(Function() MyMsgBox(
                 $"下载地址暂时无法读取 ZIP 分段。是否改为下载完整 ZIP（{Size / 1048576.0:F1} MB）？",
                 "下载完整整合包", "下载", "取消") = 1),

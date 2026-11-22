@@ -255,8 +255,12 @@ public sealed partial class PackUpdater {
         Path = (string)item["path"]!, Name = (string?)item["display"]?["name"] ?? (string)item["path"]!, Icon = (string?)item["display"]?["icon_url"] ?? "",
         Kind = kind, Before = hash, File = file, ModSources = item["sources"] as JArray, Reason = (string?)item["reason"] ?? ""
     });
+    internal const int DownloadRounds = 2;
+
     public void Apply(PackPlan preview, Func<PackRuntime> prepareRuntime, Action<string> progress, Action<string, string, long>? download = null,
         PackDownloadOptions? options = null) {
+        var control = options?.Control;
+        control?.ThrowIfCanceled();
         if (NeedsRecovery) throw new IOException("请先恢复上次更新。");
         var plan = Plan(preview.Release, preview.Selected, preview.ModProjectsByHash);
         if (Signature(plan) != Signature(preview)) throw new IOException("本地文件已变化，请重新检查更新。");
@@ -267,31 +271,54 @@ public sealed partial class PackUpdater {
             var staged = new Dictionary<PackChange, string>();
             var skipped = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             int index = 0;
+            var downloads = plan.Changes.Where(c => c.File != null).ToList();
+            int fileNumber = 0;
+            var reportTransfer = options?.ReportTransfer;
+            void ReportTransfer(PackTransferProgress snapshot) {
+                string text = $"({fileNumber}/{downloads.Count}) {snapshot.Text}";
+                if (reportTransfer == null) progress(text);
+                else reportTransfer(snapshot with { Text = text });
+            }
             using (var archive = archived ? new PackArchive((JObject)plan.Release["archive"]!, Work("downloads/" + (string)plan.Release["archive"]!["sha256"]! + ".zip"),
-                progress, options?.ApproveWholeArchive, options?.DownloadRange, options?.Mirror) : null)
-            foreach (var change in plan.Changes.Where(c => c.File != null)) {
+                progress, options?.ApproveWholeArchive, options?.DownloadRange, options?.Mirror, ReportTransfer, control) : null)
+            foreach (var change in downloads) {
+                control?.ThrowIfCanceled();
+                fileNumber++;
                 if (archived) {
-                    if (!StageArchiveFile(change, archive!, staged, progress, download, options)) skipped.Add(change.Path);
+                    if (!StageArchiveFile(change, archive!, staged, progress, download, options, ReportTransfer)) skipped.Add(change.Path);
                     continue;
                 }
                 var file = change.File!; string target = Work("stage/" + index++); Exception? error = null;
-                foreach (var address in file["urls"]!) {
-                    string url = address.Value<string>()!;
-                    try {
-                        progress("正在从 " + PackChange.DownloadSourceFor(url) + " 下载：" + change.Name);
-                        if (download != null) download(url, target, (long)file["size"]!);
-                        else { using var output = File.Create(target); PackProtocol.Download(url, output, (long)file["size"]!, bytes => progress($"{change.Name}：{bytes / 1024:N0} / {(long)file["size"]! / 1024:N0} KB")); }
-                        if (new FileInfo(target).Length != (long)file["size"]! || PackProtocol.HashFile(target) != (string?)file["sha256"]) throw new IOException("下载文件校验失败：" + change.Path);
-                        error = null; break;
-                    } catch (Exception ex) { error = ex; }
+                var urls = file["urls"]!.Values<string>().ToArray();
+                for (int round = 0; round < DownloadRounds; round++) {
+                    string title = round == 0 ? change.Name : $"{change.Name}（第 {round + 1} 轮）";
+                    for (int route = 0; route < urls.Length; route++) {
+                        control?.ThrowIfCanceled();
+                        string url = urls[route]!;
+                        try {
+                            string label = "正在从 " + PackChange.DownloadSourceFor(url) + " 下载：" + title;
+                            progress(label);
+                            if (download != null) download(url, target, (long)file["size"]!);
+                            else {
+                                using var output = File.Create(target);
+                                bool canSwitch = route + 1 < urls.Length || (urls.Length > 1 && round + 1 < DownloadRounds);
+                                PackProtocol.Download(url, output, (long)file["size"]!, label, ReportTransfer, control: control, canSwitch: canSwitch);
+                            }
+                            if (new FileInfo(target).Length != (long)file["size"]! || PackProtocol.HashFile(target) != (string?)file["sha256"]) throw new IOException("下载文件校验失败：" + change.Path);
+                            error = null; break;
+                        } catch (Exception ex) when (ex is not PackUpdateCanceledException) { error = ex; }
+                    }
+                    if (error == null) break;
                 }
                 if (error != null) throw error;
                 staged[change] = target;
             }
+            control?.ThrowIfCanceled();
             var changes = plan.Changes.Where(c => !skipped.Contains(c.Path) &&
                 (c.DependsOn == null || !skipped.Contains(c.DependsOn))).ToList();
             if (plan.IsCurrentArchiveRelease && changes.Count == 0) { progress("没有可应用的模组修复。"); return; }
             progress("正在准备游戏运行环境……"); var runtime = prepareRuntime();
+            control?.ThrowIfCanceled();
             if (plan.Changes.Count == 0 && runtime.Paths.Count == 0 && (string?)plan.State["release_id"] == (string?)plan.Release["release"]!["id"] &&
                 new HashSet<string>((plan.State["selected"] as JArray ?? new JArray()).Select(item => item.Value<string>()!)).SetEquals(plan.Selected)) {
                 progress("已是最新，文件检查通过。"); return;
@@ -305,6 +332,7 @@ public sealed partial class PackUpdater {
             Directory.CreateDirectory(backupFolder);
             var entries = new JArray(); int n = 0;
             foreach (string path in paths) {
+                control?.ThrowIfCanceled();
                 string source = PackProtocol.Safe(root, path, true); bool exists = File.Exists(source);
                 string backup = "files/" + n++;
                 if (exists) { string dest = PackProtocol.Safe(backupFolder, backup, true); Directory.CreateDirectory(System.IO.Path.GetDirectoryName(dest)!); File.Copy(source, dest); }
@@ -312,6 +340,7 @@ public sealed partial class PackUpdater {
             }
             var journal = new JObject { ["status"] = "applying", ["files"] = entries };
             Atomic(Work("stage/backup/journal.json"), journal);
+            control?.BeginApply();
             Directory.Move(backupFolder, pending);
             try {
                 progress("正在应用运行环境……"); runtime.Commit();
