@@ -77,8 +77,25 @@ internal static partial class Program {
             var mirror = new PackMirror(PackMirror.DefaultAddress);
             Assert(!mirror.PreferMirror, "The primary source should still come first by default");
             updater.Bind(PackMirror.DefaultPrimaryAddress, "test", "stable", mirror);
+            Assert(PackUpdater.GetBoundMirror(updater.Binding)?.PreferMirror == false, "A saved primary-first binding should remain primary-first");
+            updater.Bind(PackMirror.DefaultPrimaryAddress, "test", "stable", new PackMirror(PackMirror.DefaultAddress, preferMirror: true));
+            Assert(PackUpdater.GetBoundMirror(updater.Binding)?.PreferMirror == true, "A saved S3-first binding should remain S3-first");
             updater.Bind(PackMirror.DefaultPrimaryAddress, "test", "stable");
             Assert((string?)new PackUpdater(root).Binding["mirror_url"] == "", "Clearing the mirror should survive reopening");
+            Assert(PackUpdater.GetBoundMirror(updater.Binding) == null, "An explicitly cleared mirror should stay disabled");
+        });
+        Test("startup check skips uninstalled packs and requires the installed channel", root => {
+            var updater = new PackUpdater(root);
+            updater.Bind("https://pack.example", "test", "preview");
+            Assert(updater.CheckForUpdate() == null, "A binding without an installed release should not trigger a check");
+
+            Write(root, ".pcl-update/state.json", """
+                {"pack_id":"test","channel":"stable","release_id":"v1","sequence":1}
+                """);
+            try {
+                updater.CheckForUpdate();
+                throw new Exception("The startup check accepted a source bound to another channel");
+            } catch (IOException ex) when (ex.Message == "此实例缺少匹配的整合包更新源。") { }
         });
         Test("publisher credentials share across instances and migrate by storage target", root => {
             string store = Path.Combine(root, "shared");

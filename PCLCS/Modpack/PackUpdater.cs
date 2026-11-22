@@ -102,17 +102,53 @@ public sealed partial class PackUpdater {
         if (mirror != null) binding["prefer_mirror"] = mirror.PreferMirror;
         Atomic(Work("binding.json"), binding);
     }
-    public static JObject GetIndex(string source, PackMirror? mirror = null) {
+    public JObject? CheckForUpdate() {
+        var state = State;
+        var installedId = (string?)state["release_id"];
+        if (string.IsNullOrEmpty(installedId)) return null;
+        if (NeedsRecovery) throw new IOException("上次更新尚未完成，请先恢复。");
+
+        var binding = Binding;
+        var source = (string?)binding["source"];
+        var packId = (string?)state["pack_id"];
+        var channelId = (string?)state["channel"];
+        if (string.IsNullOrWhiteSpace(source) || string.IsNullOrEmpty(packId) || string.IsNullOrEmpty(channelId) ||
+            packId != (string?)binding["pack_id"] || channelId != (string?)binding["channel"])
+            throw new IOException("此实例缺少匹配的整合包更新源。");
+
+        var mirror = GetBoundMirror(binding);
+        var index = GetIndex((string?)binding["index_url"] ?? source!, mirror, shortTimeout: true);
+        var pack = index["packs"]!.OfType<JObject>().FirstOrDefault(item => (string?)item["id"] == packId);
+        var channel = pack?["channels"]!.OfType<JObject>().FirstOrDefault(item => (string?)item["id"] == channelId);
+        if (pack == null || channel == null) throw new IOException("更新源没有此整合包或频道。");
+
+        long installedSequence = (long)state["sequence"]!;
+        long latestSequence = (long)channel["sequence"]!;
+        if (latestSequence < installedSequence || (latestSequence == installedSequence && (string?)channel["release_id"] != installedId))
+            throw new IOException("服务器返回了旧版本或冲突的发布序号。");
+        if (latestSequence == installedSequence) return null;
+
+        var release = GetRelease(pack, channel, mirror, shortTimeout: true);
+        if (NeedsRecovery || !JToken.DeepEquals(state, State) || !JToken.DeepEquals(binding, Binding)) return null;
+        return release;
+    }
+    public static PackMirror? GetBoundMirror(JObject binding) {
+        var address = (string?)binding["mirror_url"] ?? PackMirror.DefaultAddressFor((string?)binding["source"] ?? "");
+        return string.IsNullOrWhiteSpace(address) ? null : new PackMirror(address, (bool?)binding["prefer_mirror"] ?? true);
+    }
+    public static JObject GetIndex(string source, PackMirror? mirror = null) => GetIndex(source, mirror, shortTimeout: false);
+    private static JObject GetIndex(string source, PackMirror? mirror, bool shortTimeout) {
         JObject Read(string address, bool _) {
-            var value = PackProtocol.Parse(PackProtocol.Fetch(address, 8 * 1024 * 1024, mirror != null));
+            var value = PackProtocol.Parse(PackProtocol.Fetch(address, 8 * 1024 * 1024, shortTimeout || mirror != null));
             PackProtocol.Validate(value, "index");
             return value;
         }
         return mirror == null ? Read(source, false) : mirror.Read(source, PackProtocol.IndexPath, Read);
     }
-    public static JObject GetRelease(JObject pack, JObject channel, PackMirror? mirror = null) {
+    public static JObject GetRelease(JObject pack, JObject channel, PackMirror? mirror = null) => GetRelease(pack, channel, mirror, shortTimeout: false);
+    private static JObject GetRelease(JObject pack, JObject channel, PackMirror? mirror, bool shortTimeout) {
         JObject Read(string address, bool _) {
-            var bytes = PackProtocol.Fetch(address, 8 * 1024 * 1024, mirror != null);
+            var bytes = PackProtocol.Fetch(address, 8 * 1024 * 1024, shortTimeout || mirror != null);
             if (PackProtocol.Hash(bytes) != (string?)channel["manifest_sha256"]) throw new InvalidDataException("更新清单校验失败，请重新检查更新。");
             var value = PackProtocol.Parse(bytes); PackProtocol.Validate(value, "release");
             if ((string?)value["pack"]!["id"] != (string?)pack["id"] || (string?)value["release"]!["channel"] != (string?)channel["id"] || (string?)value["release"]!["id"] != (string?)channel["release_id"] || (long)value["release"]!["sequence"]! != (long)channel["sequence"]!) throw new InvalidDataException("服务器目录和版本清单不一致。");

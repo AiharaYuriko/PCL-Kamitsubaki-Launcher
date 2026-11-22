@@ -22,6 +22,10 @@ Public Class MyMsgText
             Btn3.Text = Converter.Button3
             Btn2.Visibility = If(Converter.Button2 = "", Visibility.Collapsed, Visibility.Visible)
             Btn3.Visibility = If(Converter.Button3 = "", Visibility.Collapsed, Visibility.Visible)
+            If Converter.CheckBoxText <> "" Then
+                OptionCheckBox.Text = Converter.CheckBoxText
+                OptionCheckBox.Visibility = Visibility.Visible
+            End If
             ShapeLine.StrokeThickness = GetWPFSize(1)
 
         Catch ex As Exception
@@ -33,7 +37,12 @@ Public Class MyMsgText
         Try
 
             'UI 初始化
-            If Btn2.IsVisible AndAlso Not Btn1.ColorType = MyButton.ColorState.Red Then Btn1.ColorType = MyButton.ColorState.Highlight
+            If Btn2.IsVisible AndAlso Btn1.ColorType <> MyButton.ColorState.Red Then
+                Dim Buttons = {Btn1, Btn2, Btn3}
+                Dim Index = MyConverter.HighlightButton
+                Dim Highlighted = If(Index >= 1 AndAlso Index <= Buttons.Length, Buttons(Index - 1), Btn1)
+                If Highlighted.IsVisible Then Highlighted.ColorType = MyButton.ColorState.Highlight
+            End If
             Btn1.Focus()
             '动画
             Opacity = 0
@@ -51,6 +60,7 @@ Public Class MyMsgText
         End Try
     End Sub
     Private Sub Close()
+        MyConverter.CheckBoxChecked = OptionCheckBox.Checked
         '结束线程阻塞
         If MyConverter.ForceWait OrElse Not MyConverter.Button2 = "" Then MyConverter.WaitFrame.Continue = False
         Interop.ComponentDispatcher.PopModal()

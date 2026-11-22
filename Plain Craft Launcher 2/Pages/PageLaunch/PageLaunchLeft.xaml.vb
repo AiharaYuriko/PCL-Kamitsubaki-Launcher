@@ -1,3 +1,4 @@
+Imports System.Threading.Tasks
 Imports System.Windows.Threading
 
 Public Class PageLaunchLeft
@@ -5,6 +6,12 @@ Public Class PageLaunchLeft
     '加载当前版本
     Private IsLoad As Boolean = False
     Private IsLoadFinished As Boolean = False
+    Private ReadOnly StartupInstanceSelection As New TaskCompletionSource(Of McInstance)(TaskCreationOptions.RunContinuationsAsynchronously)
+    Friend ReadOnly Property StartupInstance As Task(Of McInstance)
+        Get
+            Return StartupInstanceSelection.Task
+        End Get
+    End Property
     Public Sub PageLaunchLeft_Loaded() Handles Me.Loaded
         If IsLoad Then RefreshPage(True, False)
 
@@ -80,6 +87,7 @@ Public Class PageLaunchLeft
             RunInUi(
             Sub()
                 McInstanceSelected = Instance '绕这一圈是为了避免 McVersionCheck 触发第二次版本改变
+                StartupInstanceSelection.TrySetResult(Instance)
                 IsLoadFinished = True
                 RefreshButtonsUI()
                 RefreshPage(False, False) '有可能选择的版本变化了，需要重新刷新

@@ -1,7 +1,137 @@
 Imports PCL.Modpack
+Imports System.Threading.Tasks
 
 Public Module ModPackUpdate
     Public Const DefaultPackSource As String = PackMirror.DefaultPrimaryAddress
+    Private StartupCheckStarted As Boolean
+
+    Friend Async Function CheckStartupUpdate(Selection As Task(Of McInstance)) As Task
+        If StartupCheckStarted Then Return
+        StartupCheckStarted = True
+        Dim Instance = Await Selection
+        If Instance Is Nothing Then Return
+        Dim Release As JObject
+        Try
+            Release = Await Task.Run(Function() New PackUpdater(Instance.PathVersion).CheckForUpdate())
+        Catch ex As Exception
+            Logger.Warn(ex, $"检查整合包更新失败：{Instance.Name}")
+            Hint($"{Instance.Name} 的整合包更新检查失败，请在整合包更新页重试。", HintType.Red)
+            Return
+        End Try
+        If Release Is Nothing Then Return
+
+        Dim ReleaseInfo = Release("release")
+        Dim ReleaseId = CStr(ReleaseInfo("id"))
+        Dim ReleaseKey As String = New JArray(Release("pack")("id"), ReleaseInfo("channel"), ReleaseInfo("id"),
+                                              ReleaseInfo("sequence")).ToString(Newtonsoft.Json.Formatting.None)
+        Dim Message = $"{Instance.Name} 有整合包更新（{ReleaseId}）。"
+        If Settings.Get(Of String)("VersionPackUpdateDismissedRelease", Instance:=Instance) = ReleaseKey Then
+            Hint(Message)
+            Return
+        End If
+        Dim Quiet As Boolean
+        Dim Choice = MyMsgBox(Message & vbCrLf & "一键更新将沿用此实例已保存的组件选择。", "整合包更新",
+                              "查看更新详情", "一键更新", "稍后", CheckBoxText:="此更新版本不再弹窗", CheckBoxChecked:=Quiet,
+                              HighlightButton:=2)
+        If Quiet Then Settings.Set("VersionPackUpdateDismissedRelease", ReleaseKey, Instance:=Instance)
+        Select Case Choice
+            Case 1
+                If McInstanceLock.IsLocked(Instance) Then
+                    Hint("该版本正在被修改，请稍后进入整合包更新页。", HintType.Red)
+                    Return
+                End If
+                If FrmMain.PageCurrent = FormMain.PageType.InstanceSetup AndAlso PageInstanceLeft.Instance IsNot Nothing AndAlso
+                    Not PathUtils.IsSame(PageInstanceLeft.Instance.PathVersion, Instance.PathVersion) Then
+                    FrmMain.PageChange(FormMain.PageType.Launch)
+                End If
+                Instance.Load()
+                PageInstanceLeft.Instance = Instance
+                FrmMain.PageChange(FormMain.PageType.InstanceSetup, FormMain.PageSubType.InstancePackUpdate)
+            Case 2
+                StartQuickUpdate(Instance, Release)
+            Case 3
+                If Quiet Then Hint(Message)
+        End Select
+    End Function
+
+    Private Sub StartQuickUpdate(Instance As McInstance, OfferedRelease As JObject)
+        Dim Updater As New PackUpdater(Instance.PathVersion, AddressOf PageInstancePackPublish.ResolveModSources)
+        If StartPackTask(Instance, Updater,
+            Function(Progress)
+                Dim Binding = Updater.Binding
+                Dim Release = Updater.CheckForUpdate()
+                If Release Is Nothing OrElse Not JToken.DeepEquals(OfferedRelease, Release) OrElse Not JToken.DeepEquals(Binding, Updater.Binding) Then
+                    Throw New IOException("更新信息已变更，请到整合包更新页重新检查。")
+                End If
+                Dim Saved = TryCast(Updater.State("selected"), JArray)
+                Dim Selected = If(Saved IsNot Nothing, Saved.Values(Of String)(),
+                                  Release("components").Where(Function(Component) CBool(Component("default_selected"))).
+                                      Select(Function(Component) CStr(Component("id"))))
+                Dim Plan = Updater.Plan(Release, Selected)
+                If Plan.BaselineMatches.HasValue AndAlso Plan.BaselineMatches.Value = 0 Then
+                    Throw New IOException("当前实例没有匹配旧版基线的文件，请到整合包更新页核对变更预览。")
+                End If
+                ApplyPackUpdate(Instance, Updater, Plan, PackUpdater.GetBoundMirror(Binding), Progress)
+                Return $"{Instance.Name} 的整合包已更新。"
+            End Function, Sub(Message, Kind) Hint(Message, Kind)) Then
+            Hint($"正在更新 {Instance.Name} 的整合包…")
+        End If
+    End Sub
+
+    Friend Function StartPackTask(Instance As McInstance, Updater As PackUpdater, Work As Func(Of Action(Of String), String),
+                                  ReportResult As Action(Of String, HintType), Optional ReportProgress As Action(Of String) = Nothing,
+                                  Optional Finished As Action = Nothing) As Boolean
+        Dim Worker As New RedoableWorker(
+            Sub()
+                Try
+                    CheckIdle(Instance)
+                    Dim Message = Work(Sub(Text)
+                                           If ReportProgress IsNot Nothing Then RunInUi(Sub() ReportProgress(Text))
+                                       End Sub)
+                    RunInUi(Sub() ReportResult(Message, HintType.Green))
+                Catch ex As Exception
+                    Logger.Warn(ex, $"整合包任务未完成：{Instance.Name}")
+                    Dim Message = "任务未完成：" & ex.Message & vbCrLf &
+                        If(Updater.NeedsRecovery, "请点击恢复上次更新。", "修正问题后重新检查即可重试。")
+                    RunInUi(Sub() ReportResult(Message, HintType.Red))
+                Finally
+                    Instance.Config.DiscardCache()
+                    RunInUi(Sub()
+                                If Not Updater.NeedsRecovery Then
+                                    Dim Refreshed = New McInstance(Instance.PathVersion).Load()
+                                    If PageInstanceLeft.Instance IsNot Nothing AndAlso PathUtils.IsSame(PageInstanceLeft.Instance.PathVersion, Instance.PathVersion) Then PageInstanceLeft.Instance = Refreshed
+                                    If McInstanceSelected IsNot Nothing AndAlso PathUtils.IsSame(McInstanceSelected.PathVersion, Instance.PathVersion) Then McInstanceSelected = Refreshed
+                                End If
+                                WriteIni(McFolderSelected & "PCL.ini", "InstanceCache", "")
+                                LoaderFolderRun(McInstanceListLoader, McFolderSelected, LoaderFolderRunType.ForceRun, MaxDepth:=1, ExtraPath:="versions\")
+                            End Sub)
+                End Try
+            End Sub)
+        If Finished IsNot Nothing Then AddHandler Worker.Stopped, Sub() RunInUi(Finished)
+        If McInstanceLock.TryAcquire(Worker, Instance.PathVersion) Then
+            Worker.Start()
+            Return True
+        End If
+        ReportResult("此实例正在执行其他任务，请稍后重试。", HintType.Red)
+        Return False
+    End Function
+
+    Friend Sub ApplyPackUpdate(Instance As McInstance, Updater As PackUpdater, Plan As PackPlan, Mirror As PackMirror, Progress As Action(Of String))
+        Updater.Apply(Plan, Function() PrepareRuntime(Instance, Plan.Release), Progress, options:=New PackDownloadOptions With {
+            .Mirror = Mirror,
+            .ApproveWholeArchive = Function(Size) RunInUiWait(Function() MyMsgBox(
+                $"下载地址暂时无法读取 ZIP 分段。是否改为下载完整 ZIP（{Size / 1048576.0:F1} MB）？",
+                "下载完整整合包", "下载", "取消") = 1),
+            .SelectLocalFile = Function(Path, Failure) RunInUiWait(
+                Function()
+                    If MyMsgBox("下载失败：" & Path & vbCrLf & Failure & vbCrLf & "可选择本地的同版本文件继续。",
+                                "获取整合包文件", "选择文件", "取消") <> 1 Then Return Nothing
+                    Return Dialogs.SelectFile("选择 " & Path, False).FirstOrDefault()
+                End Function),
+            .SkipOptional = Function(Path) RunInUiWait(Function() MyMsgBox("跳过未取得的可选文件？" & vbCrLf & Path,
+                "可选文件下载失败", "跳过", "停止更新") = 1)
+        })
+    End Sub
 
     Public Sub CheckIdle(Instance As McInstance)
         If McLaunchLoader.State = LoadState.Loading OrElse HasRunningMinecraft Then Throw New Exception("请先关闭正在运行的游戏，再更新整合包。")

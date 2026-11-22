@@ -38,6 +38,7 @@ Public Class PageInstancePackUpdate
         Restore.IsEnabled = Updater.HasBackup OrElse Updater.NeedsRecovery
         If Updater.NeedsRecovery Then Status.Text = "上次更新未完成，请先点击'恢复上次更新'。恢复前暂时不能启动游戏。"
         AddHandler ReadSource.Click, Async Sub() Await LoadSource()
+        AddHandler ResetSource.Click, Async Sub() Await RestoreDefaultSource()
         AddHandler Check.Click, Async Sub() Await LoadSource()
         AddHandler Update.Click, Sub() StartUpdate(False)
         AddHandler Restore.Click, Sub() StartUpdate(True)
@@ -62,7 +63,23 @@ Public Class PageInstancePackUpdate
                                                     InvalidateSource()
                                                 End If
                                             End Sub
-        AddHandler PreferMirror.Change, Sub() InvalidateSource()
+        AddHandler PreferMirror.Change,
+            Sub(sender, user)
+                InvalidateSource()
+                If Not user Then Return
+                Try
+                    Dim SavedBinding = Updater.Binding
+                    Dim SavedSourceAddress = CStr(SavedBinding("source"))
+                    Dim MirrorAddress = MirrorSource.Text.Trim()
+                    If Not String.IsNullOrEmpty(SavedSourceAddress) AndAlso SavedSourceAddress = Source.Text.Trim() AndAlso
+                        If(CStr(SavedBinding("mirror_url")), PackMirror.DefaultAddressFor(SavedSourceAddress)) = MirrorAddress Then
+                        Dim Route = If(MirrorAddress.Length = 0, Nothing, New PackMirror(MirrorAddress, PreferMirror.Checked))
+                        SaveBoundSource(SavedBinding, SavedSourceAddress, Route)
+                    End If
+                Catch ex As Exception
+                    Status.Text = "保存线路偏好失败：" & ex.Message
+                End Try
+            End Sub
         AddHandler Loaded, Async Sub()
                                If Started Then Return
                                Started = True
@@ -72,14 +89,51 @@ Public Class PageInstancePackUpdate
 
     Private Sub InvalidateSource()
         Choices.Items.Clear()
+        Release = Nothing
+        Components.Children.Clear()
+        Details.Children.Clear()
         Mirror = Nothing
         Preview = Nothing
         Update.IsEnabled = False
     End Sub
 
+    Private Sub SaveBoundSource(Binding As JObject, Address As String, Route As PackMirror)
+        Dim PackId = CStr(Binding("pack_id"))
+        Dim ChannelId = CStr(Binding("channel"))
+        If String.IsNullOrEmpty(PackId) OrElse String.IsNullOrEmpty(ChannelId) Then Return
+        If Address = CStr(Binding("source")) AndAlso If(Route?.Address, "") = CStr(Binding("mirror_url")) AndAlso
+            (Route Is Nothing OrElse Route.PreferMirror = CBool(If(Binding("prefer_mirror"), New JValue(True)))) Then Return
+        If McInstanceLock.IsLocked(Target) Then Throw New IOException("此实例正在执行其他任务，请稍后重试。")
+        Updater.Bind(Address, PackId, ChannelId, Route)
+    End Sub
+
+    Private Async Function RestoreDefaultSource() As Task
+        If Busy Then Return
+        FollowDefaultMirror = True
+        Source.Text = ModPackUpdate.DefaultPackSource
+        FillingDefaultMirror = True
+        Try
+            MirrorSource.Text = PackMirror.DefaultAddress
+        Finally
+            FillingDefaultMirror = False
+        End Try
+        InvalidateSource()
+        Try
+            SaveBoundSource(Updater.Binding, Source.Text, New PackMirror(MirrorSource.Text, PreferMirror.Checked))
+        Catch ex As Exception
+            Status.Text = "恢复默认更新源失败：" & ex.Message
+            Return
+        End Try
+        If Updater.NeedsRecovery Then
+            Status.Text = "已恢复默认更新源。请先恢复上次更新，再重新检查。"
+        Else
+            Await LoadSource()
+        End If
+    End Function
+
     Private Sub SetBusy(Value As Boolean)
         Busy = Value : Source.IsEnabled = Not Value : Choices.IsEnabled = Not Value : Components.IsEnabled = Not Value
-        ReadSource.IsEnabled = Not Value : Check.IsEnabled = Not Value
+        ReadSource.IsEnabled = Not Value : ResetSource.IsEnabled = Not Value : Check.IsEnabled = Not Value
         MirrorSource.IsEnabled = Not Value
         PreferMirror.IsEnabled = Not Value AndAlso Not String.IsNullOrWhiteSpace(MirrorSource.Text)
         Update.IsEnabled = Not Value AndAlso Preview IsNot Nothing AndAlso Not Preview.IsApplied
@@ -148,6 +202,11 @@ Public Class PageInstancePackUpdate
             LoadingComponents = False
             Dim Selected = SelectedComponents()
             Preview = Await Task.Run(Function() Updater.Plan(Release, Selected))
+            Dim Binding = Updater.Binding
+            If CStr(Binding("pack_id")) = CStr(Release("pack")("id")) AndAlso
+                CStr(Binding("channel")) = CStr(Release("release")("channel")) Then
+                SaveBoundSource(Binding, Source.Text.Trim(), Mirror)
+            End If
             If Preview.IsCurrentArchiveRelease Then
                 LoadingComponents = True
                 For Each Box In Components.Children.OfType(Of MyCheckBox)()
@@ -254,52 +313,19 @@ Public Class PageInstancePackUpdate
         Dim Address = Source.Text.Trim()
         Dim DownloadMirror = Mirror
         SetBusy(True)
-        Dim Worker As New RedoableWorker(
-        Sub()
-            Try
-                ModPackUpdate.CheckIdle(Target)
+        If Not ModPackUpdate.StartPackTask(Target, Updater,
+            Function(Progress)
                 If IsRestore Then
                     Updater.Rollback()
-                Else
-                    Updater.Bind(Address, CStr(Plan.Release("pack")("id")), CStr(Plan.Release("release")("channel")), DownloadMirror)
-                    Updater.Apply(Plan, Function() ModPackUpdate.PrepareRuntime(Target, Plan.Release),
-                        Sub(Message) RunInUi(Sub() Status.Text = Message), options:=New PackDownloadOptions With {
-                            .Mirror = DownloadMirror,
-                            .ApproveWholeArchive = Function(Size) RunInUiWait(Function() MyMsgBox(
-                                $"下载地址暂时无法读取 ZIP 分段。是否改为下载完整 ZIP（{Size / 1048576.0:F1} MB）？",
-                                "下载完整整合包", "下载", "取消") = 1),
-                            .SelectLocalFile = Function(Path, Failure) RunInUiWait(
-                                Function()
-                                    If MyMsgBox("下载失败：" & Path & vbCrLf & Failure & vbCrLf & "可选择本地的同版本文件继续。",
-                                                "获取整合包文件", "选择文件", "取消") <> 1 Then Return Nothing
-                                    Return Dialogs.SelectFile("选择 " & Path, False).FirstOrDefault()
-                                End Function),
-                            .SkipOptional = Function(Path) RunInUiWait(Function() MyMsgBox("跳过未取得的可选文件？" & vbCrLf & Path,
-                                "可选文件下载失败", "跳过", "停止更新") = 1)
-                        })
+                    Return "已恢复，可以重新检查更新。"
                 End If
-                RunInUi(Sub() Status.Text = If(IsRestore, "已恢复，可以重新检查更新。", "更新完成，可以返回启动页启动游戏。仅保留最近一次回退备份。"))
-            Catch ex As Exception
-                RunInUi(Sub() Status.Text = "任务未完成：" & ex.Message & vbCrLf & If(Updater.NeedsRecovery, "请点击恢复上次更新。", "修正问题后重新检查即可重试。"))
-            Finally
-                Target.Config.DiscardCache()
-                RunInUi(Sub()
-                            Preview = Nothing
-                            If Not Updater.NeedsRecovery Then
-                                Dim Refreshed = New McInstance(Target.PathVersion).Load()
-                                If PageInstanceLeft.Instance IsNot Nothing AndAlso PathUtils.IsSame(PageInstanceLeft.Instance.PathVersion, Target.PathVersion) Then PageInstanceLeft.Instance = Refreshed
-                                If McInstanceSelected IsNot Nothing AndAlso PathUtils.IsSame(McInstanceSelected.PathVersion, Target.PathVersion) Then McInstanceSelected = Refreshed
-                            End If
-                            WriteIni(McFolderSelected & "PCL.ini", "InstanceCache", "")
-                            LoaderFolderRun(McInstanceListLoader, McFolderSelected, LoaderFolderRunType.ForceRun, MaxDepth:=1, ExtraPath:="versions\")
-                        End Sub)
-            End Try
-        End Sub)
-        AddHandler Worker.Stopped, Sub() RunInUi(Sub() SetBusy(False))
-        If McInstanceLock.TryAcquire(Worker, Target.PathVersion) Then
-            Worker.Start()
-        Else
-            Status.Text = "此实例正在执行其他任务，请稍后重试。" : SetBusy(False)
-        End If
+                Updater.Bind(Address, CStr(Plan.Release("pack")("id")), CStr(Plan.Release("release")("channel")), DownloadMirror)
+                ModPackUpdate.ApplyPackUpdate(Target, Updater, Plan, DownloadMirror, Progress)
+                Return "更新完成，可以返回启动页启动游戏。仅保留最近一次回退备份。"
+            End Function, Sub(Message, Kind) Status.Text = Message, Sub(Text) Status.Text = Text,
+            Sub()
+                Preview = Nothing
+                SetBusy(False)
+            End Sub) Then SetBusy(False)
     End Sub
 End Class

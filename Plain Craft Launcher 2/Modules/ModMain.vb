@@ -182,6 +182,9 @@ EndHint:
         Public Button1 As String = "确定"
         Public Button2 As String = ""
         Public Button3 As String = ""
+        Public CheckBoxText As String = ""
+        Public CheckBoxChecked As Boolean
+        Public HighlightButton As Integer = 1
         ''' <summary>
         ''' 点击第一个按钮将执行该方法，不关闭弹窗。
         ''' </summary>
@@ -230,9 +233,13 @@ EndHint:
     Public Function MyMsgBox(Caption As String, Optional Title As String = "提示",
                              Optional Button1 As String = "确定", Optional Button2 As String = "", Optional Button3 As String = "",
                              Optional IsWarn As Boolean = False, Optional HighLight As Boolean = True, Optional ForceWait As Boolean = False,
-                             Optional Button1Action As Action = Nothing, Optional Button2Action As Action = Nothing, Optional Button3Action As Action = Nothing) As Integer
+                             Optional Button1Action As Action = Nothing, Optional Button2Action As Action = Nothing, Optional Button3Action As Action = Nothing,
+                             Optional CheckBoxText As String = "", Optional ByRef CheckBoxChecked As Boolean = False,
+                             Optional HighlightButton As Integer = 1) As Integer
         '将弹窗列入队列
         Dim Converter As New MyMsgBoxConverter With {.Type = MyMsgBoxType.Text, .Button1 = Button1, .Button2 = Button2, .Button3 = Button3, .Text = Caption, .IsWarn = IsWarn, .Title = Title, .HighLight = HighLight, .ForceWait = True, .Button1Action = Button1Action, .Button2Action = Button2Action, .Button3Action = Button3Action}
+        Converter.CheckBoxText = CheckBoxText
+        Converter.HighlightButton = HighlightButton
         If Button2.Length > 0 OrElse ForceWait Then
             '若有多个按钮则开始等待
             If FrmMain Is Nothing OrElse FrmMain.PanMsg Is Nothing AndAlso RunInUi() Then
@@ -264,6 +271,7 @@ EndHint:
                     ComponentDispatcher.PopModal()
                 End Try
             End If
+            CheckBoxChecked = Converter.CheckBoxChecked
             Logger.Info($"普通弹框返回：{If(Converter.Result, "null")}")
             Return Converter.Result
         Else

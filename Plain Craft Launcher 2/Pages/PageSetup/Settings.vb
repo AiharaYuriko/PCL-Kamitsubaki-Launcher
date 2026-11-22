@@ -181,6 +181,7 @@ Public Class Settings
         New Setting("VersionAdvanceDisableJLW", False, Source:=Sources.Instance),
         New Setting("VersionAdvanceDisableLUA", False, Source:=Sources.Instance),
         New Setting("VersionAdvanceDisableModUpdate", False, Source:=Sources.Instance),
+        New Setting("VersionPackUpdateDismissedRelease", "", Source:=Sources.Instance),
         New Setting("VersionAdvanceGC", 0, Source:=Sources.Instance),
         New Setting("VersionRamType", 2, Source:=Sources.Instance, OnChanged:=AddressOf PageInstanceSetup.OnVersionRamTypeChanged),
         New Setting("VersionRamCustom", 15, Source:=Sources.Instance),

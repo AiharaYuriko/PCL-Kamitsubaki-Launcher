@@ -172,8 +172,10 @@ Public Class FormMain
                         Settings.Set("SystemEulaVersion", EulaVersion)
                     Case 2
                         EndProgram(False)
+                        Return
                 End Select
             End If
+            RunInUi(Async Sub() Await ModPackUpdate.CheckStartupUpdate(FrmLaunchLeft.StartupInstance))
             '启动加载器池
             Try
                 JavaInit() '延后到同意协议后再执行，避免在初次启动时进行进程操作
@@ -1127,7 +1129,8 @@ Public Class FormMain
             Select Case Stack.Page
                 Case PageType.InstanceSetup
                     If FrmInstanceLeft Is Nothing Then FrmInstanceLeft = New PageInstanceLeft
-                    CType(FrmInstanceLeft.PanItem.Children(SubType), MyListItem).SetChecked(True, True, Stack = PageCurrent)
+                    Dim Item = FrmInstanceLeft.PanItem.Children.OfType(Of MyListItem)().First(Function(Entry) Val(Entry.Tag) = SubType)
+                    Item.SetChecked(True, True, Stack = PageCurrent)
             End Select
             PageChangeActual(Stack, SubType)
         End If
