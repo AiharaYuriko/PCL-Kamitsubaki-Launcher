@@ -1199,6 +1199,12 @@ Retry:
         Dim Arguments As New List(Of String)
         McLaunchLog("参数获取开始")
         Arguments.AddRange(McLaunchArgumentsJVM()) 'JVM 参数
+        If Runtime.InteropServices.RuntimeInformation.OSArchitecture = Runtime.InteropServices.Architecture.X64 Then
+            Dim FreeType = McLibListGet(McInstanceSelected, False).Find(
+                Function(Library) Library.Name = "org.lwjgl:lwjgl-freetype:natives-windows")
+            Dim FreeTypePath = McLaunchPrepareFreeType(FreeType, Loader)
+            If FreeTypePath IsNot Nothing Then Arguments.Add("-Dorg.lwjgl.freetype.libname=" & FreeTypePath)
+        End If
         Arguments.Add(McInstanceSelected.JsonObject("mainClass")) 'mainClass
         Arguments.AddRange(McLaunchArgumentsGame()) '游戏参数
         '替换
@@ -1222,6 +1228,66 @@ Retry:
         '输出
         McLaunchArgument = Argument.TrimEnd
     End Sub
+
+    Private Function McLaunchPrepareFreeType(Native As McLibEntry, Loader As LoaderBase) As String
+        If Native Is Nothing Then Return Nothing
+        Dim Patch As (Version As String, JarSize As Long, JarHash As String, DllHash As String)
+        Select Case Native.OriginalName.Split(":"c)(2)
+            '26.1–26.2 的官方构建也可配合仍使用旧版 FreeType 的 LWJGL 3.3.x。
+            Case "3.3.2", "3.3.3", "3.3.6", "3.4.1", "3.4.1-mojang-2.15.0.3"
+                Patch = ("3.4.1-mojang-2.15.0.3", 1190827,
+                         "fd96af6301a49d6421decf695f46d251db5e0ad452b7f3d832ae3adf1e903336",
+                         "cf19c270fc9bc17f5c34b21f72f2d26cad376a9bab0a77b7f9aa622214443dc9")
+            '26.3–26.4 的官方构建也可配合仍使用 LWJGL 3.4.2 的快照。
+            Case "3.4.2", "3.4.3", "3.4.3-mojang-2.15.0"
+                Patch = ("3.4.3-mojang-2.15.0", 1190826,
+                         "efdce69d4bc8b63c04a7ea133f4b1acc9005eea00893078d696ca219b3a1bfd1",
+                         "cf79a6c3b6e8466fa9124ac795a6753512f6a715a768dc7d59b1de22ba19345b")
+            Case Else
+                Return Nothing
+        End Select
+
+        Dim DllPath = Path.GetFullPath(Path.Combine(McFolderSelected, "libraries", "org", "lwjgl", "lwjgl-freetype",
+                                                   Patch.Version, "windows-x64", "freetype.dll"))
+        Dim DllCheck As New FileChecker With {.Hash = Patch.DllHash}
+        If DllCheck.Check(DllPath) Is Nothing Then Return DllPath
+
+        Dim Coordinate = $"org.lwjgl:lwjgl-freetype:{Patch.Version}:natives-windows"
+        Dim JarPath = McLibGet(Coordinate)
+        Dim JarCheck As New FileChecker With {.ActualSize = Patch.JarSize, .Hash = Patch.JarHash}
+        Dim TempJar As String = Nothing
+        Try
+            If JarCheck.Check(JarPath) IsNot Nothing Then
+                McLaunchLog($"正在下载 FreeType 安全修复：{Patch.Version}")
+                TempJar = FileUtils.CreateRandom()
+                Dim NativeUrl = "https://libraries.minecraft.net/" & McLibGet(Coordinate, WithHead:=False).Replace("\", "/")
+                NetDownloadByLoader(NativeUrl, TempJar, Loader, JarCheck)
+                JarPath = TempJar
+            End If
+            Using Jar As ZipArchive = FileUtils.OpenZip(JarPath)
+                Dim Entry = Jar.GetEntry("windows/x64/org/lwjgl/freetype/freetype.dll")
+                If Entry Is Nothing Then Throw New InvalidDataException("FreeType 原生库缺失")
+                Using Source = Entry.Open(), Content As New MemoryStream()
+                    Source.CopyTo(Content)
+                    Dim Bytes = Content.ToArray()
+                    If CryptographyUtils.ComputeHash(Bytes, CryptographyUtils.HashMethod.Sha256) <> Patch.DllHash Then
+                        Throw New InvalidDataException("FreeType 原生库的 SHA-256 校验失败")
+                    End If
+                    Try
+                        FileUtils.WriteAtomic(DllPath, Bytes)
+                    Catch ex As IOException When DllCheck.Check(DllPath) Is Nothing
+                        '另一个启动器进程已写入同一份修复库。
+                    End Try
+                End Using
+            End Using
+        Catch ex As Exception
+            ex.ThrowIfCanceled()
+            Throw New InvalidOperationException("无法准备 FreeType 安全修复，请检查网络和游戏文件夹权限后重试。", ex)
+        Finally
+            If TempJar IsNot Nothing Then FileUtils.Delete(TempJar)
+        End Try
+        Return DllPath
+    End Function
 
     'JVM 部分
     Private Function McLaunchArgumentsJVM() As List(Of String)
